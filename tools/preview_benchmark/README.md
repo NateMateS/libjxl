@@ -134,10 +134,10 @@ Options:
 - `--preview_downsampling N`: preview factor (1, 2, 4 or 8; 1 is the full
   decode). Default: 4.
 - `--iterations N`: repetitions per mode. Default: 5. With 0, nothing is timed
-  and only `--save-previews` runs.
-- `--threads N`: decoder threads. Default: 0, the library default
-  (`JxlThreadParallelRunnerDefaultNumWorkerThreads`), which preview decodes
-  lower for images with few groups (see `effective_num_threads` below).
+  and only `--save-previews` runs, which it then needs.
+- `--threads N`: decoder threads, the same for both modes. Default: 0, the
+  library default (`JxlThreadParallelRunnerDefaultNumWorkerThreads`), lowered
+  for images with few groups (see `effective_num_threads` below).
 - `--in_process`: decode in the `preview_bench` process instead of in
   `preview_bench_worker` processes (see below).
 - `--csv PATH`, `--json PATH`: write the results.
@@ -147,6 +147,12 @@ Options:
 
 `preview_bench` exits with a non-zero status if any input fails, after
 printing its error; inputs that fail are left out of the CSV and JSON output.
+
+For an animation, the full decode decodes every frame, as `djxl` does, and the
+preview decode only the first displayed frame (the text output shows the frame
+count of a decode of several frames, and the JSON output `frame_count`). Its
+speedup is then the skipped frames plus the preview rendering; the gains of the
+preview render methods are best read from still images.
 
 Benchmark GUI (accepts file or directory arguments):
 
@@ -262,8 +268,8 @@ Metric portability:
   so small files show noisy CPU times: use more iterations and larger images
   for CPU comparisons.
 - `effective_num_threads` is the actual thread count passed to
-  `JxlThreadParallelRunnerMake` for that mode and image. With `--threads=0`,
-  preview mode scales it by the number of 256x256 groups of the *source*
+  `JxlThreadParallelRunnerMake` for that image, the same in both modes. With
+  `--threads=0`, it is scaled by the number of 256x256 groups of the *source*
   image, which the decoder visits whatever the preview size, so it is lower
   than the system default only for images with few groups.
 - `throughput_src_mpx_per_s` is

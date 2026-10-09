@@ -401,13 +401,10 @@ double CurrentCpuTimeMs() {
 }
 
 size_t PreviewBenchEffectiveNumThreads(const std::vector<uint8_t>& compressed,
-                                       const PreviewBenchOptions& options,
-                                       PreviewBenchMode mode) {
+                                       const PreviewBenchOptions& options) {
   const size_t default_threads =
       EffectiveThreadCountOrDefault(options.num_threads);
-  if (options.num_threads != 0 || mode != PreviewBenchMode::kPreview) {
-    return default_threads;
-  }
+  if (options.num_threads != 0) return default_threads;
 
   JxlDecoder* dec = JxlDecoderCreate(nullptr);
   if (dec == nullptr) return default_threads;
@@ -449,11 +446,12 @@ size_t PreviewBenchEffectiveNumThreads(const std::vector<uint8_t>& compressed,
     return default_threads;
   }
 
-  // Scale threads by source image groups, not output size. The decoder visits
-  // every source group regardless of the preview output dimensions; only the
-  // amount of work per group is reduced for VarDCT. Using output dimensions
-  // would severely under-thread VarDCT previews and still under-thread modular
-  // ones due to the pixel_cap denominator.
+  // Scale threads by source image groups, not output size, so that full and
+  // preview decodes of an image get the same count. The decoder visits every
+  // source group regardless of the preview output dimensions; only the amount
+  // of work per group is reduced for VarDCT. Using output dimensions would
+  // severely under-thread VarDCT previews and still under-thread modular ones
+  // due to the pixel_cap denominator.
   const size_t suggested = std::max<size_t>(
       1, JxlResizableParallelRunnerSuggestThreads(info.xsize, info.ysize));
   const size_t approx_groups =
@@ -473,6 +471,24 @@ size_t PreviewBenchEffectiveNumThreads(const std::vector<uint8_t>& compressed,
   const size_t threads = std::min(
       default_threads, std::min(group_cap, std::max(suggested, min_threads)));
   return std::max<size_t>(min_threads, threads);
+}
+
+bool IsPreviewBenchOption(const std::string& arg, const std::string& name) {
+  return arg.compare(0, name.size(), name) == 0 &&
+         (arg.size() == name.size() || arg[name.size()] == '=');
+}
+
+bool ParsePreviewBenchOptionValue(int argc, const char* argv[], int* index,
+                                  std::string* value) {
+  const std::string arg = argv[*index];
+  const size_t equals = arg.find('=');
+  if (equals != std::string::npos) {
+    *value = arg.substr(equals + 1);
+    return true;
+  }
+  if (*index + 1 >= argc) return false;
+  *value = argv[++(*index)];
+  return true;
 }
 
 namespace {
@@ -1087,7 +1103,7 @@ bool DecodeForBenchmark(const std::string& pathname,
   }
 
   auto runner = JxlThreadParallelRunnerMake(
-      nullptr, PreviewBenchEffectiveNumThreads(compressed, options, mode));
+      nullptr, PreviewBenchEffectiveNumThreads(compressed, options));
   if (!runner) {
     if (error) *error = "Failed to create the thread runner";
     return false;
@@ -1313,7 +1329,7 @@ bool BenchmarkJxlFile(const std::string& pathname,
                        &summary->source_ysize);
 
   const size_t effective_num_threads =
-      PreviewBenchEffectiveNumThreads(compressed, options, mode);
+      PreviewBenchEffectiveNumThreads(compressed, options);
   auto runner = JxlThreadParallelRunnerMake(nullptr, effective_num_threads);
   if (!runner) {
     summary->error = "Failed to create the thread runner";
@@ -1460,6 +1476,8 @@ std::string FormatSummaryText(const PreviewBenchSummary& summary) {
   } else {
     os << ", " << summary.output_xsize << "\xC3\x97" << summary.output_ysize;
   }
+  // The full decode of an animation decodes every frame, a preview the first.
+  if (summary.frame_count > 1) os << ", " << summary.frame_count << " frames";
   if (summary.mode == PreviewBenchMode::kPreview) {
     os << ", " << PreviewBackendName(summary.preview_backend);
   }

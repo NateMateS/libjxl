@@ -9,7 +9,8 @@
 # - preview_bench_gui (JPEGXL_ENABLE_BENCHMARK) and preview_demo_gui, with
 #   JPEGXL_ENABLE_VIEWERS and Qt 6. Not installed.
 # - preview_api_test (BUILD_TESTING): exercises lib/extras/preview.h. Not
-#   installed.
+#   installed. BUILD_TESTING also registers CTests of preview_bench's command
+#   line and workers.
 
 # Copying the DLLs that the executables need next to them lets them run from
 # the build tree on Windows.
@@ -208,5 +209,38 @@ if(BUILD_TESTING)
   else()
     add_test(NAME preview_api_test
       COMMAND preview_api_test ${preview_api_test_inputs})
+  endif()
+
+  if(TARGET preview_bench AND NOT EMSCRIPTEN)
+    # preview_bench rejects an invalid command line, with `message`, before it
+    # looks at its input.
+    function(jxl_preview_bench_reject_test name message)
+      add_test(NAME preview_bench_rejects_${name}
+        COMMAND preview_bench ${ARGN} input.jxl)
+      set_tests_properties(preview_bench_rejects_${name} PROPERTIES
+        PASS_REGULAR_EXPRESSION "${message}")
+    endfunction()
+    jxl_preview_bench_reject_test(invalid_factor
+      "must be 1, 2, 4 or 8" --preview_downsampling=3)
+    jxl_preview_bench_reject_test(negative_threads
+      "Invalid value for --threads" --threads=-1)
+    jxl_preview_bench_reject_test(empty_iterations
+      "Invalid value for --iterations" --iterations=)
+    jxl_preview_bench_reject_test(option_prefix
+      "Unknown option: --threadsX" --threadsX=4)
+    jxl_preview_bench_reject_test(nothing_to_do
+      "needs --save-previews" --iterations=0)
+
+    # A benchmark in preview_bench_worker processes, which parse the arguments
+    # preview_bench passes them.
+    set(preview_bench_input "${JPEGXL_TEST_DATA_PATH}/jxl/splines.jxl")
+    if(EXISTS "${preview_bench_input}")
+      add_test(NAME preview_bench_worker_run
+        COMMAND preview_bench --iterations=1 "${preview_bench_input}")
+    else()
+      message(STATUS
+        "preview_bench_worker_run is not registered with CTest, missing test "
+        "data: ${preview_bench_input}")
+    endif()
   endif()
 endif()  # BUILD_TESTING

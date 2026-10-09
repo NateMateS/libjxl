@@ -13,10 +13,13 @@
 
 #include "lib/extras/enc/encode.h"
 #include "lib/jxl/base/printf_macros.h"
+#include "tools/cmdline.h"
 #include "tools/preview_benchmark/benchmark_core.h"
 
 namespace {
 
+using jpegxl::tools::IsPreviewBenchOption;
+using jpegxl::tools::ParsePreviewBenchOptionValue;
 using jpegxl::tools::PreviewBenchMeasurement;
 
 struct Args {
@@ -27,30 +30,10 @@ struct Args {
   std::vector<std::string> inputs;
 };
 
-bool ParseSizeT(const char* text, size_t* value) {
-  char* end = nullptr;
-  const unsigned long long parsed = std::strtoull(text, &end, 10);
-  if (end == nullptr || *end != '\0') return false;
-  *value = static_cast<size_t>(parsed);
-  return true;
-}
-
-bool ParseOptionValue(int argc, const char* argv[], int* index,
-                      std::string* value) {
-  const std::string arg = argv[*index];
-  const size_t equals = arg.find('=');
-  if (equals != std::string::npos) {
-    *value = arg.substr(equals + 1);
-    return true;
-  }
-  if (*index + 1 >= argc) return false;
-  *value = argv[++(*index)];
-  return true;
-}
-
-void PrintUsage(const char* program) {
+// Prints the help to `out`: stdout when asked for, stderr after an error.
+void PrintUsage(FILE* out, const char* program) {
   fprintf(
-      stderr,
+      out,
       "Usage: %s [OPTIONS] INPUT...\n"
       "Benchmarks JPEG XL full decode against preview decode.\n\n"
       "Each decode runs in its own preview_bench_worker process, which\n"
@@ -61,9 +44,11 @@ void PrintUsage(const char* program) {
       "                            the full decode). Default: 4\n"
       "  --iterations N            Benchmark repetitions per mode. 0 = save "
       "previews\n"
-      "                            only (no timing). Default: 5\n"
-      "  --threads N               Worker thread count. 0 uses the library "
-      "default.\n"
+      "                            only (no timing; needs --save-previews).\n"
+      "                            Default: 5\n"
+      "  --threads N               Decoder threads, the same for both modes.\n"
+      "                            0 = the library default, lowered for\n"
+      "                            images with few groups. Default: 0\n"
       "  --in_process              Decode in this process instead of in\n"
       "                            preview_bench_worker processes. The\n"
       "                            results are tagged in_process and have no\n"
@@ -77,47 +62,63 @@ void PrintUsage(const char* program) {
       program);
 }
 
+// Parses the value of the option at argv[*index] (see
+// ParsePreviewBenchOptionValue) as cjxl and djxl parse unsigned values: a
+// minus sign, an empty value, trailing characters and overflow are errors.
+bool ParseUnsignedOption(int argc, const char* argv[], int* index,
+                         size_t* value) {
+  std::string text;
+  return ParsePreviewBenchOptionValue(argc, argv, index, &text) &&
+         jpegxl::tools::ParseUnsigned(text.c_str(), value);
+}
+
+// Parses the value of the option at argv[*index] as a path, which cannot be
+// empty.
+bool ParsePathOption(int argc, const char* argv[], int* index,
+                     std::string* path) {
+  return ParsePreviewBenchOptionValue(argc, argv, index, path) &&
+         !path->empty();
+}
+
 bool ParseArgs(int argc, const char* argv[], Args* args) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "-h" || arg == "--help") {
-      PrintUsage(argv[0]);
+      PrintUsage(stdout, argv[0]);
       std::exit(EXIT_SUCCESS);
-    } else if (arg.rfind("--preview_downsampling", 0) == 0) {
-      std::string value;
-      if (!ParseOptionValue(argc, argv, &i, &value) ||
-          !ParseSizeT(value.c_str(), &args->options.preview_downsampling)) {
-        fprintf(stderr, "Invalid value for --preview_downsampling\n");
+    } else if (IsPreviewBenchOption(arg, "--preview_downsampling")) {
+      size_t& factor = args->options.preview_downsampling;
+      if (!ParseUnsignedOption(argc, argv, &i, &factor) ||
+          (factor != 1 && factor != 2 && factor != 4 && factor != 8)) {
+        fprintf(stderr,
+                "Invalid value for --preview_downsampling: must be 1, 2, 4 "
+                "or 8\n");
         return false;
       }
-    } else if (arg.rfind("--iterations", 0) == 0) {
-      std::string value;
-      if (!ParseOptionValue(argc, argv, &i, &value) ||
-          !ParseSizeT(value.c_str(), &args->options.num_reps)) {
+    } else if (IsPreviewBenchOption(arg, "--iterations")) {
+      if (!ParseUnsignedOption(argc, argv, &i, &args->options.num_reps)) {
         fprintf(stderr, "Invalid value for --iterations\n");
         return false;
       }
-    } else if (arg.rfind("--threads", 0) == 0) {
-      std::string value;
-      if (!ParseOptionValue(argc, argv, &i, &value) ||
-          !ParseSizeT(value.c_str(), &args->options.num_threads)) {
+    } else if (IsPreviewBenchOption(arg, "--threads")) {
+      if (!ParseUnsignedOption(argc, argv, &i, &args->options.num_threads)) {
         fprintf(stderr, "Invalid value for --threads\n");
         return false;
       }
     } else if (arg == "--in_process") {
       args->options.measurement = PreviewBenchMeasurement::kInProcess;
-    } else if (arg.rfind("--csv", 0) == 0) {
-      if (!ParseOptionValue(argc, argv, &i, &args->csv_path)) {
+    } else if (IsPreviewBenchOption(arg, "--csv")) {
+      if (!ParsePathOption(argc, argv, &i, &args->csv_path)) {
         fprintf(stderr, "Invalid value for --csv\n");
         return false;
       }
-    } else if (arg.rfind("--json", 0) == 0) {
-      if (!ParseOptionValue(argc, argv, &i, &args->json_path)) {
+    } else if (IsPreviewBenchOption(arg, "--json")) {
+      if (!ParsePathOption(argc, argv, &i, &args->json_path)) {
         fprintf(stderr, "Invalid value for --json\n");
         return false;
       }
-    } else if (arg.rfind("--save-previews", 0) == 0) {
-      if (!ParseOptionValue(argc, argv, &i, &args->save_previews_dir)) {
+    } else if (IsPreviewBenchOption(arg, "--save-previews")) {
+      if (!ParsePathOption(argc, argv, &i, &args->save_previews_dir)) {
         fprintf(stderr, "Invalid value for --save-previews\n");
         return false;
       }
@@ -131,6 +132,12 @@ bool ParseArgs(int argc, const char* argv[], Args* args) {
 
   if (args->inputs.empty()) {
     fprintf(stderr, "No input files or directories were provided.\n");
+    return false;
+  }
+  if (args->options.num_reps == 0 && args->save_previews_dir.empty()) {
+    fprintf(stderr,
+            "--iterations=0 times nothing and only saves previews: it needs "
+            "--save-previews.\n");
     return false;
   }
   return true;
@@ -209,7 +216,7 @@ bool SavePreview(const std::string& input,
 int main(int argc, const char* argv[]) {
   Args args;
   if (!ParseArgs(argc, argv, &args)) {
-    PrintUsage(argv[0]);
+    PrintUsage(stderr, argv[0]);
     return EXIT_FAILURE;
   }
 

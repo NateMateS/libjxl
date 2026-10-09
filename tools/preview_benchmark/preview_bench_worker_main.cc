@@ -17,6 +17,7 @@
 #include "lib/extras/dec/jxl.h"
 #include "lib/extras/packed_image.h"
 #include "lib/extras/time.h"
+#include "tools/cmdline.h"
 #include "tools/preview_benchmark/benchmark_core.h"
 #include "tools/tracking_memory_manager.h"
 
@@ -24,6 +25,9 @@ namespace {
 
 using jpegxl::tools::AcceptedFormats;
 using jpegxl::tools::CurrentCpuTimeMs;
+using jpegxl::tools::IsPreviewBenchOption;
+using jpegxl::tools::ParsePreviewBenchOptionValue;
+using jpegxl::tools::ParseUnsigned;
 using jpegxl::tools::PreviewBackendName;
 using jpegxl::tools::PreviewBenchMode;
 
@@ -34,33 +38,12 @@ struct Args {
   PreviewBenchMode mode = PreviewBenchMode::kFull;
 };
 
-bool ParseSizeT(const char* text, size_t* value) {
-  char* end = nullptr;
-  const unsigned long long parsed = std::strtoull(text, &end, 10);
-  if (end == nullptr || *end != '\0') return false;
-  *value = static_cast<size_t>(parsed);
-  return true;
-}
-
-bool ParseOptionValue(int argc, const char* argv[], int* index,
-                      std::string* value) {
-  const std::string arg = argv[*index];
-  const size_t equals = arg.find('=');
-  if (equals != std::string::npos) {
-    *value = arg.substr(equals + 1);
-    return true;
-  }
-  if (*index + 1 >= argc) return false;
-  *value = argv[++(*index)];
-  return true;
-}
-
 bool ParseArgs(int argc, const char* argv[], Args* args) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
-    if (arg.rfind("--mode", 0) == 0) {
+    if (IsPreviewBenchOption(arg, "--mode")) {
       std::string value;
-      if (!ParseOptionValue(argc, argv, &i, &value)) return false;
+      if (!ParsePreviewBenchOptionValue(argc, argv, &i, &value)) return false;
       if (value == "full") {
         args->mode = PreviewBenchMode::kFull;
       } else if (value == "preview") {
@@ -68,24 +51,29 @@ bool ParseArgs(int argc, const char* argv[], Args* args) {
       } else {
         return false;
       }
-    } else if (arg.rfind("--input", 0) == 0) {
-      if (!ParseOptionValue(argc, argv, &i, &args->input_path)) return false;
-    } else if (arg.rfind("--result", 0) == 0) {
-      if (!ParseOptionValue(argc, argv, &i, &args->result_path)) return false;
-    } else if (arg.rfind("--threads", 0) == 0) {
-      std::string value;
-      if (!ParseOptionValue(argc, argv, &i, &value) ||
-          !ParseSizeT(value.c_str(), &args->options.num_threads)) {
+    } else if (IsPreviewBenchOption(arg, "--input")) {
+      if (!ParsePreviewBenchOptionValue(argc, argv, &i, &args->input_path)) {
         return false;
       }
-    } else if (arg.rfind("--preview_downsampling", 0) == 0) {
-      std::string value;
-      if (!ParseOptionValue(argc, argv, &i, &value) ||
-          !ParseSizeT(value.c_str(), &args->options.preview_downsampling)) {
+    } else if (IsPreviewBenchOption(arg, "--result")) {
+      if (!ParsePreviewBenchOptionValue(argc, argv, &i, &args->result_path)) {
         return false;
       }
-    } else if (arg.rfind("--color_space", 0) == 0) {
-      if (!ParseOptionValue(argc, argv, &i, &args->options.color_space)) {
+    } else if (IsPreviewBenchOption(arg, "--threads")) {
+      std::string value;
+      if (!ParsePreviewBenchOptionValue(argc, argv, &i, &value) ||
+          !ParseUnsigned(value.c_str(), &args->options.num_threads)) {
+        return false;
+      }
+    } else if (IsPreviewBenchOption(arg, "--preview_downsampling")) {
+      std::string value;
+      if (!ParsePreviewBenchOptionValue(argc, argv, &i, &value) ||
+          !ParseUnsigned(value.c_str(), &args->options.preview_downsampling)) {
+        return false;
+      }
+    } else if (IsPreviewBenchOption(arg, "--color_space")) {
+      if (!ParsePreviewBenchOptionValue(argc, argv, &i,
+                                        &args->options.color_space)) {
         return false;
       }
     } else {
@@ -145,8 +133,8 @@ int main(int argc, const char* argv[]) {
   }
 
   auto runner = JxlThreadParallelRunnerMake(
-      nullptr, jpegxl::tools::PreviewBenchEffectiveNumThreads(
-                   compressed, args.options, args.mode));
+      nullptr,
+      jpegxl::tools::PreviewBenchEffectiveNumThreads(compressed, args.options));
   if (!runner) {
     WriteResult(args.result_path, false, "Failed to create thread runner", run);
     return EXIT_FAILURE;

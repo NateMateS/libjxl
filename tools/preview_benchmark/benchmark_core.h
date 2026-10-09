@@ -178,9 +178,22 @@ double CurrentCpuTimeMs();
 bool ExpandJxlInputs(const std::vector<std::string>& roots,
                      std::vector<std::string>* inputs, std::string* error);
 
+// The decoder thread count for `compressed`, the same in both modes:
+// options.num_threads, or if that is 0 the library default, lowered for images
+// with few groups.
 size_t PreviewBenchEffectiveNumThreads(const std::vector<uint8_t>& compressed,
-                                       const PreviewBenchOptions& options,
-                                       PreviewBenchMode mode);
+                                       const PreviewBenchOptions& options);
+
+// Command-line parsing shared by preview_bench and preview_bench_worker, whose
+// options are passed as "--name VALUE" or "--name=VALUE".
+// Returns whether `arg` is the option `name` ("--threads" or "--threads=4" for
+// "--threads", but not "--threadsX").
+bool IsPreviewBenchOption(const std::string& arg, const std::string& name);
+// Reads the value of the option at argv[*index]: what follows its '=', or else
+// the next argument, which *index then points to. Returns false if there is no
+// next argument.
+bool ParsePreviewBenchOptionValue(int argc, const char* argv[], int* index,
+                                  std::string* value);
 
 // Decodes `pathname` as displayed (oriented), in 8-bit sRGB.
 bool DecodeJxlForPreviewBenchmark(const std::string& pathname,
