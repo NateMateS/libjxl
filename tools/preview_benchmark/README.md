@@ -14,13 +14,15 @@ The decoder reports its render method through the public
 `jxl-internal` library, whose decoder preview hooks
 (`lib/jxl/dec_preview_internal.h`) also restrict that method. A program linking
 the shared library has no hooks: it can allow or refuse the decoder's methods
-only as a whole, `decoder_downsample`.
+only as a whole, `decoder_downsample`. `djxl --preview_downsampling=N -v`
+prints the backend it used (`Preview backend: NAME`, with the names under
+[Preview Backends](#preview-backends)).
 
 | Tool | Description | Built with |
 |------|-------------|------------|
 | `preview_bench` | CLI benchmarker: full vs. preview decode, timing, throughput, memory, and quality | `JPEGXL_ENABLE_BENCHMARK` |
 | `preview_bench_worker` | Runs one decode for `preview_bench` and `preview_bench_gui` | `JPEGXL_ENABLE_BENCHMARK` |
-| `preview_bench_gui` | Qt GUI front-end for `preview_bench` | `JPEGXL_ENABLE_BENCHMARK`, `JPEGXL_ENABLE_VIEWERS`, Qt6 |
+| `preview_bench_gui` | Qt GUI for the same benchmark (same core and worker as `preview_bench`) | `JPEGXL_ENABLE_BENCHMARK`, `JPEGXL_ENABLE_VIEWERS`, Qt6 |
 | `preview_demo_gui` | Interactive API explorer: decode options, placeholder progression, batch gallery | `JPEGXL_ENABLE_VIEWERS`, Qt6 |
 | `preview_api_test` | Headless exerciser for `lib/extras/preview.h` sanity-checking | `BUILD_TESTING` |
 
@@ -73,7 +75,10 @@ which provisions Qt6 and every other build dependency.
 
 The `preview_benchmark` subdirectory is not a standalone CMake project --
 it must be configured as part of the main libjxl build. Run from the
-repository root (the directory containing the top-level `CMakeLists.txt`):
+repository root (the directory containing the top-level `CMakeLists.txt`).
+`BUILD_TESTING` (on by default) needs the `testdata` submodule: run
+`git submodule update --init --recursive` first, or pass
+`-DBUILD_TESTING=OFF`, which drops `preview_api_test`.
 
 ```bash
 cmake -S . -B build -G Ninja \
@@ -89,13 +94,14 @@ If CMake cannot find Qt6 automatically (e.g. a Homebrew install on macOS
 or a non-system path on Linux), point it explicitly:
 
 ```bash
+# macOS Homebrew:
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=ON \
   -DJPEGXL_ENABLE_VIEWERS=ON \
-  -DQt6_DIR=$(brew --prefix qt6)/lib/cmake/Qt6   # macOS Homebrew
-# or
-  -DQt6_DIR=/opt/Qt/6.x.y/gcc_64/lib/cmake/Qt6  # custom Linux install
+  -DQt6_DIR=$(brew --prefix qt6)/lib/cmake/Qt6
+# Custom Linux install: the same, with
+#   -DQt6_DIR=/opt/Qt/6.x.y/gcc_64/lib/cmake/Qt6
 ```
 
 Windows builds are not documented here; consult the upstream
@@ -123,12 +129,15 @@ CLI:
 
 Options:
 
+- `INPUT...`: `.jxl` files, or directories searched recursively for `.jxl`
+  files. A missing path or any other file ends the run before decoding.
 - `--preview_downsampling N`: preview factor (1, 2, 4 or 8; 1 is the full
   decode). Default: 4.
 - `--iterations N`: repetitions per mode. Default: 5. With 0, nothing is timed
   and only `--save-previews` runs.
-- `--threads N`: decoder threads. Default: 0, which picks the count from the
-  image (see below).
+- `--threads N`: decoder threads. Default: 0, the library default
+  (`JxlThreadParallelRunnerDefaultNumWorkerThreads`), which preview decodes
+  lower for images with few groups (see `effective_num_threads` below).
 - `--in_process`: decode in the `preview_bench` process instead of in
   `preview_bench_worker` processes (see below).
 - `--csv PATH`, `--json PATH`: write the results.
@@ -137,7 +146,7 @@ Options:
   PNG support, to `.pgm` (gray), `.ppm` (RGB) or `.pam` (with alpha).
 
 `preview_bench` exits with a non-zero status if any input fails, after
-printing its error.
+printing its error; inputs that fail are left out of the CSV and JSON output.
 
 Benchmark GUI (accepts file or directory arguments):
 
@@ -146,11 +155,12 @@ Benchmark GUI (accepts file or directory arguments):
 ./build/tools/preview_benchmark/preview_bench_gui test_images
 ```
 
-Demo GUI:
+Demo GUI (accepts `.jxl` file arguments; its Gallery tab opens a folder, from
+its button or by dropping the folder on the window):
 
 ```bash
 ./build/tools/preview_benchmark/preview_demo_gui
-./build/tools/preview_benchmark/preview_demo_gui test_images
+./build/tools/preview_benchmark/preview_demo_gui test_images/*.jxl
 ```
 
 `preview_bench` and `preview_bench_gui` locate `preview_bench_worker` next to
@@ -196,24 +206,23 @@ It can also be run on one SDR JXL and (optionally) one HDR JXL:
 ```
 
 `dump_previews.sh` regenerates a visual regression set: it drives
-`preview_bench --save-previews --iterations=0` over every `.jxl` in
-`test_images/` at downsampling factors 2, 4, 8, writes the previews to
+`preview_bench --save-previews --iterations=0` over every `.jxl` at the top
+level of `test_images/` at downsampling factors 2, 4, 8, writes the previews to
 `test_images/previews/{ds2,ds4,ds8}/` and a `summary.csv` (backend chosen per
 input and factor) to `test_images/previews/`. It exits with a non-zero status
-if any preview could not be saved:
+if any preview could not be saved. Run it from the repository root (its
+default paths are relative), with bash 4 or later:
 
 ```bash
 ./tools/preview_benchmark/dump_previews.sh
 # override search path for test images or the tool binary:
 ./tools/preview_benchmark/dump_previews.sh --input-dir path/to/images \
     --tool ./build/tools/preview_benchmark/preview_bench
+# write the previews and summary.csv elsewhere:
+./tools/preview_benchmark/dump_previews.sh --output-dir /tmp/previews
 # include factor 1 (full-resolution):
 ./tools/preview_benchmark/dump_previews.sh --factors 1,2,4,8
 ```
-
-> **Note:** Small files may show noisy CPU timing because process CPU
-> time granularity is coarse. Use more iterations and larger images for
-> meaningful CPU comparisons.
 
 ## Dispatch model and memory metrics
 
@@ -234,8 +243,9 @@ output.
   output. `preview_bench_gui` measures in-process when it cannot run
   `preview_bench_worker`, and shows which mode it uses next to the controls.
 
-The worker measures wall and CPU time only around the decode call itself, so
-process-spawn overhead is **not** charged to reported timings.
+The CSV output has the mean and stddev of the timings only, and no
+`decoder_total_bytes` or `frame_count`; the text output adds min and max, and
+the JSON output has every field below.
 
 Metric portability:
 
@@ -248,15 +258,17 @@ Metric portability:
   memory-constrained targets.
 - `wall_time_ms` / `cpu_time_ms` are reported with mean, sample standard
   deviation, min, and max across reps. Stddev distinguishes stable from noisy
-  measurements; it is 0 when only one rep is run.
+  measurements; it is 0 when only one rep is run. Process CPU time is coarse,
+  so small files show noisy CPU times: use more iterations and larger images
+  for CPU comparisons.
 - `effective_num_threads` is the actual thread count passed to
   `JxlThreadParallelRunnerMake` for that mode and image. With `--threads=0`,
   preview mode scales it by the number of 256x256 groups of the *source*
   image, which the decoder visits whatever the preview size, so it is lower
   than the system default only for images with few groups.
 - `throughput_src_mpx_per_s` is
-  `source_xsize × source_ysize / wall_time_ms.mean`, in source megapixels per
-  second, for both modes. It normalises timing across images of different
+  `source_xsize × source_ysize / (1000 × wall_time_ms.mean)`, in source
+  megapixels per second, for both modes. It normalises timing across images of different
   sizes and is the most useful single number for cross-image comparison.
 - `wall_time_ms` / `cpu_time_ms` are measured strictly around the
   `DecodeImageJXL` call. Process-spawn time is **not** included: the child
@@ -291,3 +303,17 @@ decode (`reference: boxes`). A preview of any other size (an embedded preview
 frame of another size, if the decoder returned one) is compared with boxes
 scaled to its size (`reference: proportional`), which is only an approximation
 of how that preview was made.
+
+The comparison reports, over the channels both images have, in nominal 0-1
+float units: RMSE, MAE and the maximum absolute difference (`quality_rmse`,
+`quality_mae`, `quality_max_abs` and `quality_reference` in the CSV output;
+`quality.{rmse, mae, max_abs, reference, compared_samples}` in the JSON
+output). For HDR inputs (intensity target above 255 nits), these decodes and
+the `--save-previews` images are tone-mapped to 250 nits; the timed decodes
+are not.
+
+## Diagnostics
+
+Set `JXL_PREVIEW_DEBUG=1` to log each preview frame header and the backend used
+to stderr. Building libjxl with `-DJXL_DEBUG_PREVIEW=1` also logs why the
+decoder chose its render method.

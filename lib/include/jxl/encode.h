@@ -435,6 +435,8 @@ typedef enum {
   
   /** Enable or disable LF Smoothing for lossless JPEG recompression.
    * -1 = default, 0 = disable smoothing, 1 = enable smoothing.
+   * Smoothing is never applied to a JPEG with chroma subsampling, which the
+   * decoder rejects, so -1 and 1 both enable it for 4:4:4 JPEGs only.
    */
   JXL_ENC_FRAME_SETTING_JPEG_RECON_LFS = 42,
 

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- decoder API: downsampled output. `JxlDecoderSetImageOutDownsampling` outputs
+  a frame at 1/2, 1/4 or 1/8 of its size, rendering at that size where the
+  frame allows it; at factor 8 a VarDCT frame can be rendered from its DC image
+  alone, its AC data skipped. `JxlDecoderGetImageOutDownsamplingMethod` reports
+  how the frame was rendered, and `JxlDecoderSetPreferPreviewInplaceFlush` lets
+  callers that stop after a one-frame preview reuse the frame's storage.
+- `djxl --preview_downsampling=1|2|4|8` decodes a downsampled preview, from
+  the embedded preview, a progressive step or decoder downsampling; with `-v`
+  it reports which.
+- `examples/decode_preview.cc`, and `tools/preview_benchmark` (preview
+  benchmark, demo and API test).
+
+### Changed
+
+- `JxlBasicInfo.preview` is oriented like `xsize` and `ysize`: when the decoder
+  applies the orientation, its dimensions are swapped for orientations 5 to 8.
+- `JxlDecoderSetDesiredIntensityTarget` accepts only `0` (no tone mapping) or
+  2^-24 to 65504 nits. Subnormal targets made PQ tone mapping output NaN,
+  infinity was accepted, and NaN acted as `0`.
+
+### Fixed
+
+- Lossless binary32 images with samples of mixed sign failed to encode
+  ("Residual overflow"); residuals now wrap modulo 2^32, as decoders
+  reconstruct them.
+- A progressive frame whose last sections are empty (for example a 1x1 image)
+  could not resume after `JXL_DEC_FRAME_PROGRESSION` once all input was read:
+  the decoder returned `JXL_DEC_NEED_MORE_INPUT`.
+- `JXL_COLOR_PROFILE_TARGET_DATA` reported the source profile for lossless and
+  other non-XYB images converted with `JxlDecoderSetOutputColorProfile`; it
+  now reports the output color encoding for every image.
+- Render pipeline stages copied uninitialized `OutputEncodingInfo` members
+  (undefined behavior, reported by UBSan).
+- Error messages of the tools' file I/O now end with a newline.
+
 ## [0.12.0] - 2026-07-01
 
 ### Added

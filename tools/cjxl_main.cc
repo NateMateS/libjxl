@@ -369,7 +369,8 @@ struct CompressArgs {
         '\0', "jpeg_reconstruction_lfs", "-1|0|1",
         "Disable/enable LF Smoothing for lossless "
         "JPEG reconstruction.\n"
-        "    -1 = default (let encoder decide), 0 = disable, 1 = enable.",
+        "    -1 = default (let encoder decide), 0 = disable, 1 = enable.\n"
+        "    Never applied to JPEGs with chroma subsampling.",
         &jpeg_reconstruction_lfs, &ParseInt64, -1);
 
     cmdline->AddOptionValue('\0', "num_reps", "REPS",

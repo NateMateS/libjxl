@@ -94,7 +94,8 @@ struct CompressParams {
   // allowing reconstruction of the original JPEG.
   bool force_cfl_jpeg_recompression = true;
   // Apply LF Smoothing when doing JPEG recompression. Same applies as above.
-  // Default to non-subsampled smoothing only until decoders update.
+  // 0 disables it; -1 (default) and 1 apply it to JPEGs without chroma
+  // subsampling only, as decoders reject it with subsampling (#5005).
   int force_lfs_jpeg_recompression = -1;
 
   // Use brotli compression for any boxes derived from a JPEG frame.
