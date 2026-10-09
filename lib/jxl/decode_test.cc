@@ -7774,21 +7774,68 @@ std::vector<uint8_t> CreateBlendedCropCodestream(size_t xsize, size_t ysize,
 // After blending, the output writer works in image coordinates, where the
 // frame's own edges separate its rects from the out-of-frame ones. A crop at
 // an origin that is not a multiple of the factor is rendered in full and then
-// written downsampled; an aligned one is downsampled as it is rendered.
+// written downsampled; an aligned one is downsampled as it is rendered. The
+// out-of-frame rects of the wide image span more than 1024 output pixels at
+// factor 2.
 TEST(DecodeTest, PreviewDownsamplingRegularPathBlendedCrop) {
-  constexpr size_t xsize = 301;
-  constexpr size_t ysize = 203;
-  struct Crop {
-    int x0, y0;
+  struct Case {
     size_t xsize, ysize;
+    int crop_x0, crop_y0;
+    size_t crop_xsize, crop_ysize;
   };
-  for (const Crop& crop : {Crop{37, 21, 150, 100}, Crop{-5, 150, 150, 100},
-                           Crop{40, 24, 152, 96}}) {
-    SCOPED_TRACE(::testing::Message() << crop.x0 << "," << crop.y0);
+  for (const Case& c :
+       {Case{301, 203, 37, 21, 150, 100}, Case{301, 203, -5, 150, 150, 100},
+        Case{301, 203, 40, 24, 152, 96}, Case{2400, 64, 8, 8, 160, 48}}) {
+    SCOPED_TRACE(::testing::Message()
+                 << c.xsize << "x" << c.ysize << " crop at " << c.crop_x0 << ","
+                 << c.crop_y0);
     const std::vector<uint8_t> compressed = CreateBlendedCropCodestream(
-        xsize, ysize, crop.x0, crop.y0, crop.xsize, crop.ysize);
+        c.xsize, c.ysize, c.crop_x0, c.crop_y0, c.crop_xsize, c.crop_ysize);
     VerifyWriterDownsampling(compressed, /*num_channels=*/4);
   }
+}
+
+// The streaming encoder, used by default for frames of more than 8 groups,
+// left the TOC's "no permutation" bit to the padding after the frame header:
+// a header that ended on a byte boundary went without it.
+TEST(DecodeTest, StreamingEncoderTocPermutationBit) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  const std::vector<uint8_t> compressed = CreateBlendedCropCodestream(
+      /*xsize=*/2400, /*ysize=*/64, /*crop_x0=*/8, /*crop_y0=*/8,
+      /*crop_xsize=*/160, /*crop_ysize=*/48);
+  jxl::BitReader br(jxl::Bytes(compressed.data(), compressed.size()));
+  ASSERT_EQ(br.ReadFixedBits<16>(), 0x0AFFu);
+  auto metadata = jxl::make_unique<jxl::CodecMetadata>();
+  ASSERT_TRUE(ReadSizeHeader(&br, &metadata->size));
+  ASSERT_TRUE(ReadImageMetadata(&br, &metadata->m));
+  metadata->transform_data.nonserialized_xyb_encoded = metadata->m.xyb_encoded;
+  ASSERT_TRUE(jxl::Bundle::Read(&br, &metadata->transform_data));
+  ASSERT_FALSE(metadata->m.color_encoding.WantICC());
+  ASSERT_TRUE(br.JumpToByteBoundary());
+  jxl::FrameHeader frame_header(metadata.get());
+  ASSERT_TRUE(ReadFrameHeader(&br, &frame_header));
+  // The conditions of the failure: the streaming encoder wrote frame 0, and
+  // its header ends on a byte boundary.
+  const jxl::FrameDimensions frame_dim = frame_header.ToFrameDimensions();
+  EXPECT_GT(frame_dim.num_groups, 8u);
+  EXPECT_EQ(br.TotalBitsConsumed() % jxl::kBitsPerByte, 0u);
+  std::vector<uint64_t> section_offsets;
+  std::vector<uint32_t> section_sizes;
+  uint64_t groups_total_size;
+  EXPECT_TRUE(ReadGroupOffsets(
+      memory_manager,
+      jxl::NumTocEntries(frame_dim.num_groups, frame_dim.num_dc_groups,
+                         frame_header.passes.num_passes),
+      &br, &section_offsets, &section_sizes, &groups_total_size));
+  EXPECT_TRUE(br.Close());
+
+  const JxlPixelFormat format = {4, JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN, 0};
+  const std::vector<uint8_t> pixels = jxl::DecodeWithAPI(
+      jxl::Bytes(compressed.data(), compressed.size()), format,
+      /*use_callback=*/false, /*set_buffer_early=*/false,
+      /*use_resizable_runner=*/false, /*require_boxes=*/false,
+      /*expect_success=*/true);
+  EXPECT_EQ(pixels.size(), 2400u * 64 * 4 * sizeof(uint16_t));
 }
 
 // A 1024-pixel modular group with 8x frame upsampling renders this frame as a
