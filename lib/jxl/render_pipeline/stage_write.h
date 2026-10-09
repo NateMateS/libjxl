@@ -31,7 +31,8 @@ std::unique_ptr<RenderPipelineStage> GetWriteToImage3FStage(
 
 // Gets a stage to write to a pixel callback or image buffer.
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
-    const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
+    const ImageOutput& main_output, size_t width, size_t height,
+    size_t full_width, size_t full_height, size_t downsampling, bool has_alpha,
     bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
     std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager);
 

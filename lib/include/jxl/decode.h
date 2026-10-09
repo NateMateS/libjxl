@@ -1426,7 +1426,8 @@ JxlDecoderSetProgressiveDetail(JxlDecoder* dec, JxlProgressiveDetail detail);
 /**
  * Returns the intended downsampling ratio for the progressive frame produced
  * by @ref JxlDecoderFlushImage after the latest ::JXL_DEC_FRAME_PROGRESSION
- * event.
+ * event, before any optional output downsampling configured with @ref
+ * JxlDecoderSetImageOutDownsampling is applied.
  *
  * @param dec decoder object
  * @return The intended downsampling ratio, can be `1`, `2`, `4` or `8`.
@@ -1434,9 +1435,124 @@ JxlDecoderSetProgressiveDetail(JxlDecoder* dec, JxlProgressiveDetail detail);
 JXL_EXPORT size_t JxlDecoderGetIntendedDownsamplingRatio(JxlDecoder* dec);
 
 /**
+ * Requests decoder-side downsampling for image and extra-channel output.
+ *
+ * This affects the dimensions and buffer sizes reported by @ref
+ * JxlDecoderImageOutBufferSize and @ref JxlDecoderExtraChannelBufferSize, and
+ * also affects the pixels written by @ref JxlDecoderFlushImage or the final
+ * image decode. Output dimensions are the frame dimensions divided by the
+ * factor, rounded up. It does not change @ref JxlDecoderGetBasicInfo or
+ * @ref JxlDecoderGetFrameHeader, which describe the image at full resolution.
+ * Without coalescing, a layer of `xsize` x `ysize` at `crop_x0`, `crop_y0`
+ * (from its frame header) is output at `ceil(xsize / factor)` x
+ * `ceil(ysize / factor)`; to composite it onto a canvas of
+ * `ceil(width / factor)` x `ceil(height / factor)`, place it at
+ * `floor(crop_x0 / factor)`, `floor(crop_y0 / factor)`.
+ *
+ * The output approximates the full-resolution image box-downsampled by the
+ * factor; it is not bit-exact. To produce it faster, the decoder may render at
+ * reduced resolution and skip data that does not contribute at that scale,
+ * such as restoration filters and noise synthesis. With a factor of `8`, a
+ * VarDCT frame may be rendered from its 1/8 resolution DC image alone: the
+ * frame is then complete as soon as its DC is decoded, and the rest of its
+ * data is skipped without being decoded.
+ *
+ * The boxes start at the top-left corner of the frame as stored, before the
+ * orientation is applied: when a dimension is not a multiple of the factor,
+ * the last box of each row (column) is smaller, and with an orientation that
+ * mirrors the image horizontally (vertically), it is the first output column
+ * (row).
+ *
+ * Valid factors are `1`, `2`, `4`, and `8`. The default is `1`.
+ *
+ * This must be called after the ::JXL_DEC_FRAME event and before setting the
+ * image output buffer or callback, or an extra channel buffer, for that frame.
+ * The factor applies to that frame only: once the frame is decoded or
+ * skipped, the factor is `1` again, and the outputs of the frame are released
+ * (see also @ref JxlDecoderSetPreferPreviewInplaceFlush). Frames decoded only
+ * to be used by later frames, which have no ::JXL_DEC_FRAME event, are decoded
+ * without output downsampling.
+ *
+ * @param dec decoder object
+ * @param factor output downsampling factor to apply
+ * @return ::JXL_DEC_SUCCESS on success, ::JXL_DEC_ERROR on invalid usage or
+ *     invalid factor.
+ */
+JXL_EXPORT JxlDecoderStatus JxlDecoderSetImageOutDownsampling(JxlDecoder* dec,
+                                                              size_t factor);
+
+/** How the decoder renders a frame whose output is downsampled with @ref
+ * JxlDecoderSetImageOutDownsampling.
+ */
+typedef enum {
+  /** No downsampled output: the factor is `1`, or the method is not chosen
+   * yet.
+   */
+  JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_NONE = 0,
+  /** The frame is rendered at full resolution and box-downsampled as it is
+   * written to the output.
+   */
+  JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_FULL_RESOLUTION = 1,
+  /** The frame is rendered at the output resolution: a reduced inverse DCT
+   * (VarDCT), or channels downsampled before the color transforms (modular).
+   */
+  JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_REDUCED_INPUT = 2,
+  /** The frame's own upsampling is reduced or removed to match the output
+   * resolution.
+   */
+  JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_FUSED_UPSAMPLING = 3,
+  /** A VarDCT frame at factor `8` is rendered from its DC image alone; its AC
+   * data is skipped without being decoded.
+   */
+  JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_DC_ONLY = 4,
+} JxlImageOutDownsamplingMethod;
+
+/**
+ * Outputs how the decoder renders the current frame at the factor set with
+ * @ref JxlDecoderSetImageOutDownsampling. The decoder chooses the method when
+ * it sets up the frame's rendering, once the frame's DC is decoded; until
+ * then, and for factor `1`, the method is
+ * ::JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_NONE. After the frame is decoded, the
+ * method stays available until the decoder starts the next frame.
+ *
+ * The methods differ in speed and in the detail they preserve; all of them
+ * approximate the full-resolution image box-downsampled by the factor.
+ *
+ * @param dec decoder object
+ * @param method output: the method used for the current frame
+ * @return ::JXL_DEC_SUCCESS on success, ::JXL_DEC_ERROR if @c method is NULL.
+ */
+JXL_EXPORT JxlDecoderStatus JxlDecoderGetImageOutDownsamplingMethod(
+    const JxlDecoder* dec, JxlImageOutDownsamplingMethod* method);
+
+/**
+ * Allows preview-oriented callers to request an in-place flush path.
+ *
+ * When enabled, @ref JxlDecoderFlushImage may reuse internal frame storage to
+ * reduce memory and wall-time overhead for preview extraction, and a frame
+ * decoded with output downsampling may not be stored for reference by later
+ * frames, whether or not it is flushed. Decoding therefore cannot continue
+ * after the frame: once it is flushed or fully decoded, @ref
+ * JxlDecoderProcessInput returns ::JXL_DEC_ERROR until the decoder is rewound
+ * with @ref JxlDecoderRewind or reset.
+ *
+ * This option is intended for callers that stop decoding after a preview of
+ * one frame. It must be called after ::JXL_DEC_FRAME and before the image
+ * output buffer or callback, or an extra channel buffer, is set for that
+ * frame, and applies to that frame only.
+ *
+ * @param dec decoder object
+ * @param prefer_inplace JXL_TRUE to prefer the in-place preview flush path
+ * @return ::JXL_DEC_SUCCESS on success, ::JXL_DEC_ERROR on invalid usage.
+ */
+JXL_EXPORT JxlDecoderStatus JxlDecoderSetPreferPreviewInplaceFlush(
+    JxlDecoder* dec, JXL_BOOL prefer_inplace);
+
+/**
  * Outputs progressive step towards the decoded image so far when only partial
  * input was received. If the flush was successful, the buffer set with @ref
- * JxlDecoderSetImageOutBuffer will contain partial image data.
+ * JxlDecoderSetImageOutBuffer will contain partial image data at the current
+ * output resolution.
  *
  * Can be called when @ref JxlDecoderProcessInput returns @ref
  * JXL_DEC_NEED_MORE_INPUT, after the ::JXL_DEC_FRAME event already occurred

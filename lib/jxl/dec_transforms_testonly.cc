@@ -28,6 +28,15 @@ void TransformToPixels(AcStrategyType strategy,
   (strategy, coefficients, pixels, pixels_stride, scratch_space);
 }
 
+HWY_EXPORT(TransformToReducedPixels);
+bool TransformToReducedPixels(AcStrategyType strategy,
+                              const float* coefficients, size_t factor,
+                              float* JXL_RESTRICT pixels, size_t pixels_stride,
+                              float* JXL_RESTRICT scratch) {
+  return HWY_DYNAMIC_DISPATCH(TransformToReducedPixels)(
+      strategy, coefficients, factor, pixels, pixels_stride, scratch);
+}
+
 HWY_EXPORT(LowestFrequenciesFromDC);
 void LowestFrequenciesFromDC(const jxl::AcStrategyType strategy,
                              const float* dc, size_t dc_stride, float* llf,

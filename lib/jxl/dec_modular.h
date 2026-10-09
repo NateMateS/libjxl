@@ -125,18 +125,34 @@ class ModularFrameDecoder {
                           PassesDecoderState* dec_state, jxl::ThreadPool* pool,
                           bool inplace);
   bool have_dc() const { return have_something; }
+  // Whether the channels decoded once all those with a shift of at least
+  // `min_shift` are (3 after the DC groups, a pass's minimum shift after the
+  // pass) render the whole frame at reduced resolution, with only squeeze
+  // residuals still missing, and some still missing.
+  bool IsProgressionStep(int min_shift) const;
   void MaybeDropFullImage();
   bool UsesFullImage() const { return use_full_image; }
   JxlMemoryManager* memory_manager() const { return memory_manager_; }
 
  private:
+  // `Input` provides `const std::pair<ImageF*, Rect>& GetBuffer(size_t c)`,
+  // like RenderPipelineInput.
+  template <typename Input>
   Status ModularImageToDecodedRect(const FrameHeader& frame_header, Image& gi,
                                    PassesDecoderState* dec_state,
                                    jxl::ThreadPool* pool,
-                                   RenderPipelineInput& render_pipeline_input,
+                                   Input& render_pipeline_input,
                                    Rect modular_rect) const;
+  // Like ModularImageToDecodedRect, for a pipeline whose input is reduced by
+  // `dec_state->pipeline_input_downsampling`: converts `modular_rect` at full
+  // resolution, then box-averages it into the pipeline buffers.
+  Status ModularImageToDownsampledRect(
+      const FrameHeader& frame_header, Image& gi, PassesDecoderState* dec_state,
+      RenderPipelineInput& render_pipeline_input, Rect modular_rect) const;
   JxlMemoryManager* memory_manager_;
   Image full_image;
+  // Whether each channel of `full_image` is a squeeze residual.
+  std::vector<bool> squeeze_residuals;
   std::vector<Transform> global_transform;
   FrameDimensions frame_dim;
   bool do_color;

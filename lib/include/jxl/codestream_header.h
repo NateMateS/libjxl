@@ -229,7 +229,9 @@ typedef struct {
   JXL_BOOL alpha_premultiplied;
 
   /** Dimensions of encoded preview image, only used if have_preview is
-   * JXL_TRUE.
+   * JXL_TRUE. When the decoder applies the orientation (see @ref
+   * JxlDecoderSetKeepOrientation), they are swapped for orientations 5 to 8,
+   * as xsize and ysize are: they are the dimensions of the preview output.
    */
   JxlPreviewHeader preview;
 

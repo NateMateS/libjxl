@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -32,14 +33,39 @@
 #include "lib/jxl/base/exif.h"
 #include "lib/jxl/base/printf_macros.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/dec_preview_internal.h"
 
 namespace jxl {
 namespace extras {
 namespace {
 
-#define QUIT(M)               \
-  fprintf(stderr, "%s\n", M); \
-  return false;
+// Set JXL_PREVIEW_DEBUG=1 to log the header of each preview frame and the
+// preview backend that was used. Building libjxl with -DJXL_DEBUG_PREVIEW=1
+// additionally logs why the decoder chose its render method.
+bool PreviewDebugEnabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("JXL_PREVIEW_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
+void LogPreviewFrame(const JxlBasicInfo& info, JxlFrameEncoding encoding,
+                     const JxlFrameHeader& fh, size_t preview_downsampling) {
+  if (!PreviewDebugEnabled()) return;
+  fprintf(stderr,
+          "[preview-debug] frame: enc=%s ds=%" PRIuS
+          " dur=%u is_last=%d "
+          "crop=%dx%d@(%d,%d) alpha_bits=%u extra_ch=%u xyb=%d\n",
+          encoding == JXL_FRAME_ENCODING_VAR_DCT   ? "VarDCT"
+          : encoding == JXL_FRAME_ENCODING_MODULAR ? "Modular"
+                                                   : "Unknown",
+          preview_downsampling, fh.duration, fh.is_last,
+          static_cast<int>(fh.layer_info.xsize),
+          static_cast<int>(fh.layer_info.ysize), fh.layer_info.crop_x0,
+          fh.layer_info.crop_y0, info.alpha_bits, info.num_extra_channels,
+          info.uses_original_profile ? 0 : 1);
+}
 
 struct BoxProcessor {
   explicit BoxProcessor(JxlDecoder* dec) : dec_(dec) { Reset(); }
@@ -134,18 +160,159 @@ void UpdateBitDepth(JxlBitDepth bit_depth, JxlDataType data_type, T* info) {
   }
 }
 
+// Applies the requested bit depth to the image output just set (a frame's or
+// the embedded preview's), and records it in `info`.
+bool SetOutputBitDepth(JxlDecoder* dec, const JXLDecompressParams& dparams,
+                       const JxlPixelFormat& format, JxlBasicInfo* info) {
+  if (JXL_DEC_SUCCESS !=
+      JxlDecoderSetImageOutBitDepth(dec, &dparams.output_bitdepth)) {
+    fprintf(stderr, "JxlDecoderSetImageOutBitDepth failed\n");
+    return false;
+  }
+  UpdateBitDepth(dparams.output_bitdepth, format.data_type, info);
+  if (format.num_channels == 2 || format.num_channels == 4) {
+    // Interleaved alpha channels has the same bit depth as color channels.
+    info->alpha_bits = info->bits_per_sample;
+    info->alpha_exponent_bits = info->exponent_bits_per_sample;
+  }
+  return true;
+}
+
+// Division rounding toward negative infinity, for crops (which can be
+// negative) at the preview scale.
+int32_t FloorDiv(int32_t a, int32_t b) {
+  return a / b - ((a % b != 0 && a < 0) ? 1 : 0);
+}
+
+Status ValidatePreviewDownsampling(size_t factor) {
+  if (factor == 0) {
+    return JXL_FAILURE("preview_downsampling must be >= 1");
+  }
+  if (factor == 1 || factor == 2 || factor == 4 || factor == 8) {
+    return true;
+  }
+  return JXL_FAILURE("preview_downsampling must be one of 1, 2, 4 or 8");
+}
+
+constexpr uint32_t PreviewBackendBit(JXLPreviewBackend backend) {
+  return 1u << static_cast<uint32_t>(backend);
+}
+
+// The decoder's render methods, the set kDecoderDownsample stands for.
+constexpr uint32_t kDecoderMethodBits =
+    PreviewBackendBit(JXLPreviewBackend::kNativeDcOnly) |
+    PreviewBackendBit(JXLPreviewBackend::kFallbackDownsample) |
+    PreviewBackendBit(JXLPreviewBackend::kNativeReducedInput) |
+    PreviewBackendBit(JXLPreviewBackend::kNativeFusedUpsampling);
+
+// `preview_allowed_backends` as a plain bit set: 0 allows every backend, and
+// kDecoderDownsample is equivalent to the set of methods it stands for, in
+// both directions.
+uint32_t NormalizeAllowedBackends(uint32_t mask) {
+  if (mask == 0) return ~0u;
+  const uint32_t decoder_bit =
+      PreviewBackendBit(JXLPreviewBackend::kDecoderDownsample);
+  if ((mask & decoder_bit) != 0) mask |= kDecoderMethodBits;
+  if ((mask & kDecoderMethodBits) == kDecoderMethodBits) mask |= decoder_bit;
+  return mask;
+}
+
+bool PreviewBackendAllowed(uint32_t allowed_backends,
+                           JXLPreviewBackend backend) {
+  return (allowed_backends & PreviewBackendBit(backend)) != 0;
+}
+
+bool FailWithReason(const JXLDecompressParams& dparams,
+                    JXLPreviewFailureReason reason) {
+  if (dparams.preview_failure_reason != nullptr) {
+    *dparams.preview_failure_reason = reason;
+  }
+  return false;
+}
+
+JXLPreviewBackend PreviewBackendFromMethod(
+    JxlImageOutDownsamplingMethod method) {
+  switch (method) {
+    case JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_NONE:
+      return JXLPreviewBackend::kNone;
+    case JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_FULL_RESOLUTION:
+      return JXLPreviewBackend::kFallbackDownsample;
+    case JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_REDUCED_INPUT:
+      return JXLPreviewBackend::kNativeReducedInput;
+    case JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_FUSED_UPSAMPLING:
+      return JXLPreviewBackend::kNativeFusedUpsampling;
+    case JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_DC_ONLY:
+      return JXLPreviewBackend::kNativeDcOnly;
+  }
+  return JXLPreviewBackend::kNone;
+}
+
+// The decoder's render method of the current frame at the preview scale, or
+// kNone if the frame is not (yet) rendered at a reduced scale.
+JXLPreviewBackend DecoderPreviewBackend(const JxlDecoder* dec) {
+  JxlImageOutDownsamplingMethod method = JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_NONE;
+  if (JXL_DEC_SUCCESS !=
+      JxlDecoderGetImageOutDownsamplingMethod(dec, &method)) {
+    return JXLPreviewBackend::kNone;
+  }
+  return PreviewBackendFromMethod(method);
+}
+
+// Whether the decoder's render method of the current frame is allowed.
+bool CurrentMethodAllowed(uint32_t allowed_backends, const JxlDecoder* dec) {
+  const JXLPreviewBackend backend = DecoderPreviewBackend(dec);
+  return backend == JXLPreviewBackend::kNone ||
+         PreviewBackendAllowed(allowed_backends, backend);
+}
+
 }  // namespace
 
 bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
                     const JXLDecompressParams& dparams, size_t* decoded_bytes,
                     PackedPixelFile* ppf, std::vector<uint8_t>* jpeg_bytes,
                     const SizeConstraints* constraints) {
+  if (!ValidatePreviewDownsampling(dparams.preview_downsampling)) {
+    fprintf(stderr, "Invalid preview_downsampling value\n");
+    return false;
+  }
+  if (jpeg_bytes != nullptr && dparams.preview_downsampling != 1) {
+    fprintf(stderr,
+            "preview_downsampling is not supported together with JPEG "
+            "reconstruction\n");
+    return false;
+  }
+  if (dparams.preview_backend != nullptr) {
+    *dparams.preview_backend = JXLPreviewBackend::kNone;
+  }
+  if (dparams.preview_failure_reason != nullptr) {
+    *dparams.preview_failure_reason = JXLPreviewFailureReason::kNone;
+  }
+  const bool preview_requested = dparams.preview_downsampling > 1;
+  const uint32_t allowed_backends =
+      NormalizeAllowedBackends(dparams.preview_allowed_backends);
+  // A full decode is the kNone backend; a preview needs one of the others.
+  const uint32_t output_backends =
+      preview_requested ? ~PreviewBackendBit(JXLPreviewBackend::kNone)
+                        : PreviewBackendBit(JXLPreviewBackend::kNone);
+  if ((allowed_backends & output_backends) == 0) {
+    fprintf(stderr, "No allowed preview backend can produce this output\n");
+    return FailWithReason(dparams,
+                          JXLPreviewFailureReason::kNoBackendAvailable);
+  }
   JxlSignature sig = JxlSignatureCheck(bytes, bytes_size);
   // silently return false if this is not a JXL file
-  if (sig == JXL_SIG_INVALID) return false;
+  if (sig == JXL_SIG_INVALID) {
+    return FailWithReason(dparams, JXLPreviewFailureReason::kCorruptInput);
+  }
 
   auto decoder = JxlDecoderMake(dparams.memory_manager);
   JxlDecoder* dec = decoder.get();
+  if (dec == nullptr) {
+    fprintf(stderr, "JxlDecoderMake failed\n");
+    return FailWithReason(dparams, JXLPreviewFailureReason::kOutOfMemory);
+  }
+  // Whether pixel decoding stops after the first displayed frame.
+  const bool first_frame_only = preview_requested || dparams.first_frame_only;
   ppf->frames.clear();
 
   if (dparams.runner_opaque != nullptr &&
@@ -173,6 +340,12 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
   }
 
   bool can_reconstruct_jpeg = false;
+  const size_t effective_max_downsampling = dparams.max_downsampling > 1
+                                                ? dparams.max_downsampling
+                                                : dparams.preview_downsampling;
+  bool use_embedded_preview = false;
+  bool returned_embedded_preview = false;
+  JXLPreviewBackend preview_backend_used = JXLPreviewBackend::kNone;
   std::vector<uint8_t> jpeg_data_chunk;
   if (jpeg_bytes != nullptr) {
     // This bound is very likely to be enough to hold the entire
@@ -185,7 +358,7 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
 
   bool max_passes_defined =
       (dparams.max_passes < std::numeric_limits<uint32_t>::max());
-  if (max_passes_defined || dparams.max_downsampling > 1) {
+  if (max_passes_defined || effective_max_downsampling > 1) {
     events |= JXL_DEC_FRAME_PROGRESSION;
     if (max_passes_defined) {
       JxlDecoderSetProgressiveDetail(dec, JxlProgressiveDetail::kPasses);
@@ -239,19 +412,31 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
       return false;
     }
   }
+  // The whole input is supplied at once, also for previews: the decoder pauses
+  // at each progression step regardless, and smaller pieces of input only split
+  // group decoding into smaller parallel batches.
   if (JXL_DEC_SUCCESS != JxlDecoderSetInput(dec, bytes, bytes_size)) {
     fprintf(stderr, "Decoder failed to set input\n");
     return false;
   }
   uint32_t progression_index = 0;
+  // Whether a frame progression step of the current frame already has the
+  // requested detail (see the JXL_DEC_FRAME_PROGRESSION handler).
+  bool progression_target_reached = false;
   bool codestream_done = jpeg_bytes == nullptr && accepted_formats.empty();
+  bool image_output_set = false;
+  // Whether decoding stops after the current frame (see JXL_DEC_FRAME).
+  bool stop_after_frame = false;
   BoxProcessor boxes(dec);
   uint64_t total_pixel_count = 0;
   for (;;) {
+    if (dparams.cancel != nullptr && *dparams.cancel != 0) {
+      return false;
+    }
     JxlDecoderStatus status = JxlDecoderProcessInput(dec);
     if (status == JXL_DEC_ERROR) {
       fprintf(stderr, "Failed to decode image\n");
-      return false;
+      return FailWithReason(dparams, JXLPreviewFailureReason::kCorruptInput);
     } else if (status == JXL_DEC_NEED_MORE_INPUT) {
       if (codestream_done) {
         break;
@@ -261,7 +446,8 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
           fprintf(stderr,
                   "Input file is truncated and there is no preview "
                   "available yet.\n");
-          return false;
+          return FailWithReason(dparams,
+                                JXLPreviewFailureReason::kCorruptInput);
         }
         break;
       }
@@ -271,7 +457,7 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
               ", processed bytes: %" PRIuS
               ") and --allow_partial_files is not present.\n",
               bytes_size, bytes_size - released_size);
-      return false;
+      return FailWithReason(dparams, JXLPreviewFailureReason::kCorruptInput);
     } else if (status == JXL_DEC_BOX) {
       boxes.FinalizeOutput();
       JxlBoxType box_type;
@@ -401,6 +587,19 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
         name.resize(eci.name_length);
         ppf->extra_channels_info.push_back({eci, i, name});
       }
+      // The embedded preview is returned only when it is exactly the requested
+      // preview (its size is oriented like the image's) and the output has no
+      // extra channel images, which the decoder does not output for it.
+      if (preview_requested && ppf->info.have_preview &&
+          ppf->extra_channels_info.empty() &&
+          PreviewBackendAllowed(allowed_backends,
+                                JXLPreviewBackend::kEmbeddedPreview)) {
+        use_embedded_preview =
+            ppf->info.preview.xsize ==
+                DivCeil(ppf->info.xsize, dparams.preview_downsampling) &&
+            ppf->info.preview.ysize ==
+                DivCeil(ppf->info.ysize, dparams.preview_downsampling);
+      }
     } else if (status == JXL_DEC_COLOR_ENCODING) {
       if (set_colorspace) {
         JxlDecoderSetCms(dec, *JxlGetDefaultCms());
@@ -458,18 +657,100 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
       if (constraints && (total_pixel_count > constraints->dec_max_pixels)) {
         return JXL_FAILURE("Image too big");
       }
+
       JxlFrameHeader fh;
       if (JXL_DEC_SUCCESS != JxlDecoderGetFrameHeader(dec, &fh)) {
         fprintf(stderr, "JxlDecoderGetFrameHeader failed\n");
         return false;
       }
-      JXL_ASSIGN_OR_QUIT(jxl::extras::PackedFrame frame,
-                         jxl::extras::PackedFrame::Create(
-                             fh.layer_info.xsize, fh.layer_info.ysize, format),
-                         "Failed to create image frame.");
+      JxlFrameEncoding frame_encoding = JXL_FRAME_ENCODING_UNKNOWN;
+      if (dparams.preview_hooks != nullptr &&
+          JXL_DEC_SUCCESS !=
+              dparams.preview_hooks->get_frame_encoding(dec, &frame_encoding)) {
+        frame_encoding = JXL_FRAME_ENCODING_UNKNOWN;
+      }
+      const bool pixel_output =
+          jpeg_bytes == nullptr && !accepted_formats.empty();
+      const bool preview_output = preview_requested && pixel_output;
+      // The first displayed frame ends with this frame: with coalescing, every
+      // frame is displayed; without, the layers up to the first with a duration
+      // (or the last) make it up.
+      stop_after_frame = first_frame_only && pixel_output &&
+                         (dparams.coalescing || fh.duration > 0 || fh.is_last);
+      if (preview_output) {
+        if (dparams.preview_hooks != nullptr) {
+          if (JXL_DEC_SUCCESS !=
+              dparams.preview_hooks->set_native_paths(
+                  dec,
+                  TO_JXL_BOOL(PreviewBackendAllowed(
+                      allowed_backends,
+                      JXLPreviewBackend::kNativeReducedInput)),
+                  TO_JXL_BOOL(PreviewBackendAllowed(
+                      allowed_backends,
+                      JXLPreviewBackend::kNativeFusedUpsampling)),
+                  TO_JXL_BOOL(PreviewBackendAllowed(
+                      allowed_backends, JXLPreviewBackend::kNativeDcOnly)))) {
+            fprintf(stderr, "Setting the preview render methods failed\n");
+            return false;
+          }
+        } else if (!PreviewBackendAllowed(
+                       allowed_backends,
+                       JXLPreviewBackend::kDecoderDownsample)) {
+          fprintf(stderr,
+                  "Restricting the decoder's preview render methods requires "
+                  "the decoder preview hooks\n");
+          return FailWithReason(dparams,
+                                JXLPreviewFailureReason::kNoBackendAvailable);
+        }
+        if (JXL_DEC_SUCCESS != JxlDecoderSetImageOutDownsampling(
+                                   dec, dparams.preview_downsampling)) {
+          fprintf(stderr, "JxlDecoderSetImageOutDownsampling failed\n");
+          return false;
+        }
+        // Decoding stops after this frame, so the decoder does not need to
+        // keep it for reference by later frames (and refuses to go on).
+        if (stop_after_frame &&
+            JXL_DEC_SUCCESS !=
+                JxlDecoderSetPreferPreviewInplaceFlush(dec, JXL_TRUE)) {
+          fprintf(stderr, "JxlDecoderSetPreferPreviewInplaceFlush failed\n");
+          return false;
+        }
+      }
+      if (preview_requested) {
+        LogPreviewFrame(ppf->info, frame_encoding, fh,
+                        dparams.preview_downsampling);
+      }
+
+      // The frame header is at full resolution. At the preview scale the
+      // decoder renders the frame (with coalescing, the image; without, the
+      // layer) at DivCeil(size, factor), and a layer is placed at
+      // floor(crop / factor).
+      size_t frame_xsize = fh.layer_info.xsize;
+      size_t frame_ysize = fh.layer_info.ysize;
+      if (preview_output) {
+        frame_xsize = DivCeil(frame_xsize, dparams.preview_downsampling);
+        frame_ysize = DivCeil(frame_ysize, dparams.preview_downsampling);
+      }
+      StatusOr<jxl::extras::PackedFrame> created_frame =
+          jxl::extras::PackedFrame::Create(frame_xsize, frame_ysize, format);
+      if (!created_frame.ok()) {
+        fprintf(stderr, "Failed to create image frame.\n");
+        return FailWithReason(dparams, JXLPreviewFailureReason::kOutOfMemory);
+      }
+      jxl::extras::PackedFrame frame = std::move(created_frame).value_();
       if (JXL_DEC_SUCCESS != JxlDecoderGetFrameHeader(dec, &frame.frame_info)) {
         fprintf(stderr, "JxlDecoderGetFrameHeader failed\n");
         return false;
+      }
+      if (preview_output) {
+        const int32_t factor =
+            static_cast<int32_t>(dparams.preview_downsampling);
+        frame.frame_info.layer_info.xsize = frame_xsize;
+        frame.frame_info.layer_info.ysize = frame_ysize;
+        frame.frame_info.layer_info.crop_x0 =
+            FloorDiv(frame.frame_info.layer_info.crop_x0, factor);
+        frame.frame_info.layer_info.crop_y0 =
+            FloorDiv(frame.frame_info.layer_info.crop_y0, factor);
       }
       frame.name.resize(frame.frame_info.name_length + 1, 0);
       if (JXL_DEC_SUCCESS !=
@@ -481,15 +762,39 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
       frame.name.resize(frame.frame_info.name_length);
       ppf->frames.emplace_back(std::move(frame));
       progression_index = 0;
+      progression_target_reached = false;
+      image_output_set = false;
     } else if (status == JXL_DEC_FRAME_PROGRESSION) {
       size_t downsampling = JxlDecoderGetIntendedDownsamplingRatio(dec);
-      if ((max_passes_defined && progression_index >= dparams.max_passes) ||
-          (!max_passes_defined && downsampling <= dparams.max_downsampling)) {
+      // A flush is only acceptable once it has the requested detail: enough
+      // passes, or a step at no more than effective_max_downsampling. Without
+      // an explicit max_downsampling that is the preview factor itself, so a
+      // factor 2 or 4 preview is not served from the 1/8-resolution DC step
+      // (the decoder pauses there even when the whole file is available).
+      // Callers that prefer a coarser but cheaper preview can raise
+      // max_downsampling.
+      if (max_passes_defined ? progression_index >= dparams.max_passes
+                             : downsampling <= effective_max_downsampling) {
+        progression_target_reached = true;
+      }
+      // Each frame is flushed at its target and the rest of it skipped. When
+      // decoding stops after the first displayed frame, only its last layer
+      // is: the layers before it are decoded whole, since later layers can
+      // reference them.
+      if (image_output_set && progression_target_reached &&
+          (!first_frame_only || stop_after_frame) &&
+          PreviewBackendAllowed(allowed_backends,
+                                JXLPreviewBackend::kNativeProgressionFlush) &&
+          CurrentMethodAllowed(allowed_backends, dec)) {
         if (JXL_DEC_SUCCESS != JxlDecoderFlushImage(dec)) {
           fprintf(stderr, "JxlDecoderFlushImage failed\n");
           return false;
         }
-        if (ppf->frames.back().frame_info.is_last) {
+        if (preview_requested &&
+            preview_backend_used == JXLPreviewBackend::kNone) {
+          preview_backend_used = JXLPreviewBackend::kNativeProgressionFlush;
+        }
+        if (first_frame_only || ppf->frames.back().frame_info.is_last) {
           break;
         }
         if (JXL_DEC_SUCCESS != JxlDecoderSkipCurrentFrame(dec)) {
@@ -505,13 +810,17 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
         fprintf(stderr, "JxlDecoderPreviewOutBufferSize failed\n");
         return false;
       }
-      JXL_ASSIGN_OR_QUIT(
-          jxl::extras::PackedImage preview_image,
+      StatusOr<jxl::extras::PackedImage> preview_image =
           jxl::extras::PackedImage::Create(ppf->info.preview.xsize,
-                                           ppf->info.preview.ysize, format),
-          "Failed to create preview image.");
-      ppf->preview_frame =
-          jxl::make_unique<jxl::extras::PackedFrame>(std::move(preview_image));
+                                           ppf->info.preview.ysize, format);
+      if (!preview_image.ok()) {
+        fprintf(stderr, "Failed to create preview image.\n");
+        return FailWithReason(dparams, JXLPreviewFailureReason::kOutOfMemory);
+      }
+      ppf->preview_frame = jxl::make_unique<jxl::extras::PackedFrame>(
+          std::move(preview_image).value_());
+      ppf->preview_frame->frame_info.layer_info.xsize = ppf->info.preview.xsize;
+      ppf->preview_frame->frame_info.layer_info.ysize = ppf->info.preview.ysize;
       if (buffer_size != ppf->preview_frame->color.pixels_size) {
         fprintf(stderr, "Invalid out buffer size %" PRIuS " %" PRIuS "\n",
                 buffer_size, ppf->preview_frame->color.pixels_size);
@@ -523,17 +832,19 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
         fprintf(stderr, "JxlDecoderSetPreviewOutBuffer failed\n");
         return false;
       }
+      if (!SetOutputBitDepth(dec, dparams, format, &ppf->info)) return false;
     } else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
       if (jpeg_bytes != nullptr) {
         break;
       }
       size_t buffer_size;
+      jxl::extras::PackedFrame& frame = ppf->frames.back();
+
       if (JXL_DEC_SUCCESS !=
           JxlDecoderImageOutBufferSize(dec, &format, &buffer_size)) {
         fprintf(stderr, "JxlDecoderImageOutBufferSize failed\n");
         return false;
       }
-      jxl::extras::PackedFrame& frame = ppf->frames.back();
       if (buffer_size != frame.color.pixels_size) {
         fprintf(stderr, "Invalid out buffer size %" PRIuS " %" PRIuS "\n",
                 buffer_size, frame.color.pixels_size);
@@ -563,27 +874,19 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
           return false;
         }
       }
-      if (JXL_DEC_SUCCESS !=
-          JxlDecoderSetImageOutBitDepth(dec, &dparams.output_bitdepth)) {
-        fprintf(stderr, "JxlDecoderSetImageOutBitDepth failed\n");
-        return false;
-      }
-      UpdateBitDepth(dparams.output_bitdepth, format.data_type, &ppf->info);
-      bool have_alpha = (format.num_channels == 2 || format.num_channels == 4);
-      if (have_alpha) {
-        // Interleaved alpha channels has the same bit depth as color channels.
-        ppf->info.alpha_bits = ppf->info.bits_per_sample;
-        ppf->info.alpha_exponent_bits = ppf->info.exponent_bits_per_sample;
-      }
+      if (!SetOutputBitDepth(dec, dparams, format, &ppf->info)) return false;
       JxlPixelFormat ec_format = format;
       ec_format.num_channels = 1;
       for (auto& eci : ppf->extra_channels_info) {
-        JXL_ASSIGN_OR_QUIT(jxl::extras::PackedImage image,
-                           jxl::extras::PackedImage::Create(
-                               frame.frame_info.layer_info.xsize,
-                               frame.frame_info.layer_info.ysize, ec_format),
-                           "Failed to create extra channel image.");
-        frame.extra_channels.emplace_back(std::move(image));
+        StatusOr<jxl::extras::PackedImage> image =
+            jxl::extras::PackedImage::Create(frame.frame_info.layer_info.xsize,
+                                             frame.frame_info.layer_info.ysize,
+                                             ec_format);
+        if (!image.ok()) {
+          fprintf(stderr, "Failed to create extra channel image.\n");
+          return FailWithReason(dparams, JXLPreviewFailureReason::kOutOfMemory);
+        }
+        frame.extra_channels.emplace_back(std::move(image).value_());
         auto& ec = frame.extra_channels.back();
         size_t ec_buffer_size;
         if (JXL_DEC_SUCCESS != JxlDecoderExtraChannelBufferSize(dec, &ec_format,
@@ -608,15 +911,51 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
         UpdateBitDepth(dparams.output_bitdepth, ec_format.data_type,
                        &eci.ec_info);
       }
+      image_output_set = true;
     } else if (status == JXL_DEC_SUCCESS) {
       // Decoding finished successfully.
       break;
     } else if (status == JXL_DEC_PREVIEW_IMAGE) {
-      // Nothing to do.
+      if (use_embedded_preview) {
+        if (!ppf->preview_frame) {
+          fprintf(stderr, "Embedded preview frame missing\n");
+          return false;
+        }
+        ppf->frames.clear();
+        jxl::extras::PackedFrame& preview = *ppf->preview_frame;
+        preview.frame_info.is_last = JXL_TRUE;
+        ppf->info.xsize = preview.color.xsize;
+        ppf->info.ysize = preview.color.ysize;
+        // The output is the preview, which has no preview of its own.
+        ppf->info.have_preview = JXL_FALSE;
+        ppf->info.preview = {};
+        ppf->frames.emplace_back(std::move(preview));
+        ppf->preview_frame.reset();
+        preview_backend_used = JXLPreviewBackend::kEmbeddedPreview;
+        returned_embedded_preview = true;
+        codestream_done = true;
+        break;
+      }
     } else if (status == JXL_DEC_FULL_IMAGE) {
-      if (jpeg_bytes != nullptr || ppf->frames.back().frame_info.is_last) {
+      // The decoder rendered the frame whole (a flushed frame ends at its
+      // flush): its render method must be allowed. Of several layers, the
+      // first one's is reported.
+      if (preview_requested) {
+        const JXLPreviewBackend backend = DecoderPreviewBackend(dec);
+        if (backend != JXLPreviewBackend::kNone &&
+            !PreviewBackendAllowed(allowed_backends, backend)) {
+          return FailWithReason(dparams,
+                                JXLPreviewFailureReason::kNoBackendAvailable);
+        }
+        if (preview_backend_used == JXLPreviewBackend::kNone) {
+          preview_backend_used = backend;
+        }
+      }
+      if (jpeg_bytes != nullptr || ppf->frames.back().frame_info.is_last ||
+          stop_after_frame) {
         codestream_done = true;
       }
+      if (stop_after_frame) break;
     } else {
       fprintf(stderr, "Error: unexpected status: %d\n",
               static_cast<int>(status));
@@ -658,6 +997,57 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
         jpeg_data_chunk.size() - JxlDecoderReleaseJPEGBuffer(dec);
     jpeg_bytes->insert(jpeg_bytes->end(), jpeg_data_chunk.data(),
                        jpeg_data_chunk.data() + used_jpeg_output);
+  }
+  if (preview_requested && preview_backend_used == JXLPreviewBackend::kNone &&
+      !returned_embedded_preview && jpeg_bytes == nullptr &&
+      !accepted_formats.empty() && !ppf->frames.empty()) {
+    // A frame flushed from partial input without a progression event.
+    preview_backend_used = DecoderPreviewBackend(dec);
+    if (preview_backend_used != JXLPreviewBackend::kNone &&
+        !PreviewBackendAllowed(allowed_backends, preview_backend_used)) {
+      return FailWithReason(dparams,
+                            JXLPreviewFailureReason::kNoBackendAvailable);
+    }
+  }
+  if (PreviewDebugEnabled() && preview_requested) {
+    const char* name = "kNone";
+    switch (preview_backend_used) {
+      case JXLPreviewBackend::kNone:
+        name = "kNone";
+        break;
+      case JXLPreviewBackend::kEmbeddedPreview:
+        name = "kEmbeddedPreview";
+        break;
+      case JXLPreviewBackend::kNativeDcOnly:
+        name = "kNativeDcOnly";
+        break;
+      case JXLPreviewBackend::kNativeProgressionFlush:
+        name = "kNativeProgressionFlush";
+        break;
+      case JXLPreviewBackend::kNativeReducedInput:
+        name = "kNativeReducedInput";
+        break;
+      case JXLPreviewBackend::kNativeFusedUpsampling:
+        name = "kNativeFusedUpsampling";
+        break;
+      case JXLPreviewBackend::kFallbackDownsample:
+        name = "kFallbackDownsample";
+        break;
+      case JXLPreviewBackend::kDecoderDownsample:
+        name = "kDecoderDownsample";
+        break;
+    }
+    fprintf(stderr, "[preview-debug] backend=%s\n", name);
+  }
+  if (dparams.preview_backend != nullptr) {
+    *dparams.preview_backend = preview_backend_used;
+  }
+  if (preview_requested && !returned_embedded_preview &&
+      jpeg_bytes == nullptr && !accepted_formats.empty()) {
+    // The canvas at the preview scale; without coalescing, the frames are
+    // layers on it.
+    ppf->info.xsize = DivCeil(ppf->info.xsize, dparams.preview_downsampling);
+    ppf->info.ysize = DivCeil(ppf->info.ysize, dparams.preview_downsampling);
   }
   if (decoded_bytes) {
     *decoded_bytes = bytes_size - JxlDecoderReleaseInput(dec);

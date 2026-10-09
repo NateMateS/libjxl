@@ -22,6 +22,13 @@ void TransformToPixels(AcStrategyType strategy,
                        float* JXL_RESTRICT pixels, size_t pixels_stride,
                        float* JXL_RESTRICT scratch_space);
 
+// Reduced-resolution (1/factor per axis) inverse transform; returns false if
+// the strategy/factor pair has no native reduced path.
+bool TransformToReducedPixels(AcStrategyType strategy,
+                              const float* coefficients, size_t factor,
+                              float* JXL_RESTRICT pixels, size_t pixels_stride,
+                              float* JXL_RESTRICT scratch);
+
 // Equivalent of the above for DC image.
 void LowestFrequenciesFromDC(AcStrategyType strategy, const float* dc,
                              size_t dc_stride, float* llf,

@@ -137,6 +137,7 @@ Status FrameDecoder::InitFrame(BitReader* JXL_RESTRICT br, ImageBundle* decoded,
   decoded_ = decoded;
   JXL_ENSURE(is_finalized_);
   JxlMemoryManager* memory_manager = decoded_->memory_manager();
+  progressive_preview_available_ = false;
 
   // Reset the dequantization matrices to their default values.
   dec_state_->shared_storage.matrices = DequantMatrices();
@@ -536,7 +537,8 @@ Status FrameDecoder::ProcessACGroup(size_t ac_group_id, PassesReaders& br,
   }
   decoded_passes_per_ac_group_[ac_group_id] += num_passes;
 
-  if ((frame_header_.flags & FrameHeader::kNoise) != 0) {
+  if ((frame_header_.flags & FrameHeader::kNoise) != 0 &&
+      dec_state_->pipeline_has_noise_channels) {
     PrepareNoiseInput(*dec_state_, frame_dim_, frame_header_, ac_group_id,
                       thread);
   }
@@ -657,15 +659,46 @@ Status FrameDecoder::ProcessSections(const SectionInfo* sections, size_t num,
     pipeline_options.coalescing = coalescing_;
     pipeline_options.render_spotcolors = render_spotcolors_;
     pipeline_options.render_noise = true;
+    pipeline_options.preview_no_future_frames = preview_destructive_flush_;
+    pipeline_options.allow_native_reduced_input = allow_native_reduced_input_;
+    pipeline_options.allow_native_fused_upsampling =
+        allow_native_fused_upsampling_;
+    pipeline_options.allow_native_dc_only = allow_native_dc_only_;
     JXL_RETURN_IF_ERROR(dec_state_->PreparePipeline(
         frame_header_, &frame_header_.nonserialized_metadata->m, decoded_,
         pipeline_options));
     JXL_RETURN_IF_ERROR(FinalizeDC());
     JXL_RETURN_IF_ERROR(AllocateOutput());
-    if (progressive_detail_ >= JxlProgressiveDetail::kDC) {
+    // A modular frame renders progressively only where squeeze residuals
+    // are all that is missing; its other steps are not paused at. This runs
+    // before any AC section is decoded.
+    progressive_preview_available_ = true;
+    if (frame_header_.encoding == FrameEncoding::kModular) {
+      progressive_preview_available_ =
+          modular_frame_decoder_.IsProgressionStep(/*min_shift=*/3);
+      const auto not_a_step = [this](int num_passes) {
+        int min_shift;
+        int max_shift;
+        frame_header_.passes.GetDownsamplingBracket(
+            static_cast<size_t>(num_passes - 1), min_shift, max_shift);
+        return !modular_frame_decoder_.IsProgressionStep(min_shift);
+      };
+      passes_to_pause_.erase(std::remove_if(passes_to_pause_.begin(),
+                                            passes_to_pause_.end(), not_a_step),
+                             passes_to_pause_.end());
+    }
+    if (progressive_detail_ >= JxlProgressiveDetail::kDC &&
+        progressive_preview_available_) {
       MarkSections(sections, num, section_status);
       return true;
     }
+  }
+
+  if (IsDCOnlyFrame()) {
+    // The frame is rendered from its DC (see Flush), so the AC sections are
+    // left undecoded.
+    MarkSections(sections, num, section_status);
+    return true;
   }
 
   if (finalized_dc_ && ac_global_sec != num && !decoded_ac_global_) {
@@ -747,7 +780,22 @@ Status FrameDecoder::Flush() {
     // Nothing to do.
     return true;
   }
+
   JXL_RETURN_IF_ERROR(AllocateOutput());
+
+  // For small previews avoid thread-pool wake-up overhead by running
+  // single-threaded. kSingleThreadPixels = 256*256 = 65536.
+  constexpr size_t kSingleThreadPixels = 65536;
+  const size_t output_downsampling = dec_state_->output_downsampling;
+  // Use input dimensions (not output) for threading decision: downsampling
+  // requires processing full-resolution pixels, so multi-threading helps even
+  // when output is small.
+  const size_t preview_pixels =
+      output_downsampling > 1
+          ? frame_dim_.xsize_upsampled * frame_dim_.ysize_upsampled
+          : SIZE_MAX;
+  ThreadPool* preview_pool =
+      (preview_pixels < kSingleThreadPixels) ? nullptr : pool_;
 
   uint32_t completely_decoded_ac_pass = *std::min_element(
       decoded_passes_per_ac_group_.begin(), decoded_passes_per_ac_group_.end());
@@ -776,14 +824,15 @@ Status FrameDecoder::Flush() {
           /*force_draw=*/true, /*dc_only=*/!decoded_ac_global_));
       return true;
     };
-    JXL_RETURN_IF_ERROR(RunOnPool(pool_, 0, decoded_passes_per_ac_group_.size(),
-                                  prepare_storage, process_group,
-                                  "ForceDrawGroup"));
+    JXL_RETURN_IF_ERROR(
+        RunOnPool(preview_pool, 0, decoded_passes_per_ac_group_.size(),
+                  prepare_storage, process_group, "ForceDrawGroup"));
   }
 
   // undo global modular transforms and copy int pixel buffers to float ones
   JXL_RETURN_IF_ERROR(modular_frame_decoder_.FinalizeDecoding(
-      frame_header_, dec_state_, pool_, is_finalized_));
+      frame_header_, dec_state_, preview_pool,
+      is_finalized_ || preview_destructive_flush_));
 
   return true;
 }
@@ -863,6 +912,11 @@ Status FrameDecoder::FinalizeFrame() {
   JXL_RETURN_IF_ERROR(
       modular_frame_decoder_.FinalizeDecoding(frame_header_, dec_state_, pool_,
                                               /*inplace=*/true));
+
+  if (dec_state_->output_from_image) {
+    // Blended frames are never flushed early, so the frame is complete here.
+    JXL_RETURN_IF_ERROR(dec_state_->WriteOutputFromImage(*decoded_, pool_));
+  }
 
   if (frame_header_.CanBeReferenced()) {
     auto& info = dec_state_->shared_storage

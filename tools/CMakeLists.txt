@@ -435,6 +435,10 @@ add_subdirectory(comparison_viewer)
 add_subdirectory(flicker_test)
 endif()
 
+if(JPEGXL_ENABLE_TOOLS)
+add_subdirectory(preview_benchmark)
+endif()
+
 add_subdirectory(conformance)
 add_subdirectory(wasm_demo)
 

@@ -166,6 +166,7 @@ set(JPEGXL_INTERNAL_DEC_SOURCES
   jxl/dec_noise.h
   jxl/dec_patch_dictionary.cc
   jxl/dec_patch_dictionary.h
+  jxl/dec_preview_internal.h
   jxl/dec_transforms-inl.h
   jxl/dec_xyb-inl.h
   jxl/dec_xyb.cc
@@ -439,6 +440,8 @@ set(JPEGXL_INTERNAL_EXTRAS_SOURCES
   extras/mmap.h
   extras/packed_image.cc
   extras/packed_image.h
+  extras/preview.cc
+  extras/preview.h
   extras/size_constraints.h
   extras/time.cc
   extras/time.h

@@ -115,6 +115,12 @@ struct DecompressArgs {
                             "    only decode what is needed to produce an "
                             "image intended for this downsampling ratio.",
                             &downsampling, &ParseUint32, 1);
+    cmdline->AddOptionValue(
+        '\0', "preview_downsampling", "1|2|4|8",
+        "Downsamples the decoded output by this factor for thumbnail / "
+        "preview generation. Automatically limits decode work to what is "
+        "needed to produce the downsampled output.",
+        &preview_downsampling, &ParseUint32, 1);
 
     cmdline->AddOptionFlag('\0', "allow_partial_files",
                            "Allow decoding of truncated files.",
@@ -239,6 +245,13 @@ struct DecompressArgs {
           "Invalid flag value for --num_threads: must be -1, 0 or positive.\n");
       return false;
     }
+    if (!(preview_downsampling == 1 || preview_downsampling == 2 ||
+          preview_downsampling == 4 || preview_downsampling == 8)) {
+      fprintf(stderr,
+              "Invalid flag value for --preview_downsampling: must be 1, 2, "
+              "4 or 8.\n");
+      return false;
+    }
     return true;
   }
 
@@ -254,6 +267,7 @@ struct DecompressArgs {
   double display_nits = 0.0;
   std::string color_space;
   uint32_t downsampling = 0;
+  uint32_t preview_downsampling = 1;
   bool allow_partial_files = false;
   bool pixels_to_jpeg = false;
   bool reconstruct_jpeg = false;
@@ -321,6 +335,28 @@ std::string Filename(const std::string& filename, const std::string& extension,
     out.append(extension);
   }
   return out;
+}
+
+const char* PreviewBackendName(jxl::extras::JXLPreviewBackend backend) {
+  switch (backend) {
+    case jxl::extras::JXLPreviewBackend::kNone:
+      return "none";
+    case jxl::extras::JXLPreviewBackend::kEmbeddedPreview:
+      return "embedded_preview";
+    case jxl::extras::JXLPreviewBackend::kNativeDcOnly:
+      return "native_dc_only";
+    case jxl::extras::JXLPreviewBackend::kNativeProgressionFlush:
+      return "native_progression_flush";
+    case jxl::extras::JXLPreviewBackend::kFallbackDownsample:
+      return "fallback_downsample";
+    case jxl::extras::JXLPreviewBackend::kNativeReducedInput:
+      return "native_reduced_input";
+    case jxl::extras::JXLPreviewBackend::kNativeFusedUpsampling:
+      return "native_fused_upsampling";
+    case jxl::extras::JXLPreviewBackend::kDecoderDownsample:
+      return "decoder_downsample";
+  }
+  return "unknown";
 }
 
 void AddFormatsWithAlphaChannel(std::vector<JxlPixelFormat>* formats) {
@@ -396,7 +432,11 @@ bool DecompressJxlToPackedPixelFile(
     void* runner, jxl::extras::PackedPixelFile* ppf, size_t* decoded_bytes,
     jpegxl::tools::SpeedStats* stats) {
   jxl::extras::JXLDecompressParams dparams;
+  jxl::extras::JXLPreviewBackend preview_backend =
+      jxl::extras::JXLPreviewBackend::kNone;
   dparams.max_downsampling = args.downsampling;
+  dparams.preview_downsampling = args.preview_downsampling;
+  dparams.preview_backend = &preview_backend;
   dparams.accepted_formats = accepted_formats;
   dparams.display_nits = args.display_nits;
   dparams.color_space = args.color_space;
@@ -418,6 +458,10 @@ bool DecompressJxlToPackedPixelFile(
     return false;
   }
   const double t1 = jxl::Now();
+  if (args.preview_downsampling > 1 && args.verbose && !args.quiet) {
+    fprintf(stderr, "Preview backend: %s\n",
+            PreviewBackendName(preview_backend));
+  }
   if (stats) {
     stats->NotifyElapsed(t1 - t0);
     stats->SetImageSize(ppf->info.xsize, ppf->info.ysize);
@@ -519,6 +563,12 @@ int main(int argc, const char* argv[]) {
               " used with --reconstruct_jpeg.\n");
       return EXIT_FAILURE;
     }
+    if (args.preview_downsampling > 1) {
+      fprintf(stderr,
+              "Error: --preview_downsampling cannot be used with "
+              "--reconstruct_jpeg: the reconstructed JPEG is full size.\n");
+      return EXIT_FAILURE;
+    }
   }
 
   jpegxl::tools::SpeedStats stats;
@@ -538,6 +588,8 @@ int main(int argc, const char* argv[]) {
        cmdline.GetOption(args.opt_jpeg_quality_id)->matched())) {
     decode_to_pixels = true;
   }
+  // A preview is not the JPEG the file reconstructs: it is encoded anew.
+  if (args.preview_downsampling > 1) decode_to_pixels = true;
 
   size_t num_reps = args.num_reps;
   if (!decode_to_pixels) {

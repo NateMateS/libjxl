@@ -112,6 +112,32 @@ void Transpose8x8InPlace(int32_t* JXL_RESTRICT block) {
   }
 }
 
+// Fallback box-average downsample for AC strategies that lack native reduced
+// IDCT support (DCT2x2, DCT4x4, DCT4x8, DCT8x4, IDENTITY, AFV, HORNUSS).
+// These are all small blocks (at most 16x8 pixels), so scalar code is adequate.
+void DownsamplePixels(const float* JXL_RESTRICT full, size_t full_xsize,
+                      size_t full_ysize, size_t full_stride, size_t factor,
+                      float* JXL_RESTRICT reduced, size_t reduced_stride) {
+  const size_t reduced_xsize = DivCeil(full_xsize, factor);
+  const size_t reduced_ysize = DivCeil(full_ysize, factor);
+  for (size_t y = 0; y < reduced_ysize; ++y) {
+    const size_t y0 = y * factor;
+    const size_t y1 = std::min(full_ysize, y0 + factor);
+    for (size_t x = 0; x < reduced_xsize; ++x) {
+      const size_t x0 = x * factor;
+      const size_t x1 = std::min(full_xsize, x0 + factor);
+      float sum = 0.0f;
+      for (size_t iy = y0; iy < y1; ++iy) {
+        for (size_t ix = x0; ix < x1; ++ix) {
+          sum += full[iy * full_stride + ix];
+        }
+      }
+      reduced[y * reduced_stride + x] =
+          sum / static_cast<float>((x1 - x0) * (y1 - y0));
+    }
+  }
+}
+
 template <ACType ac_type>
 void DequantLane(Vec<D> scaled_dequant_x, Vec<D> scaled_dequant_y,
                  Vec<D> scaled_dequant_b,
@@ -294,11 +320,17 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
         dec_state->shared->cmap.ytob_map.ConstRow(ty),
     };
 
+    const size_t pipeline_factor = dec_state->pipeline_input_downsampling;
+    const size_t pipeline_block_dim =
+        pipeline_factor > 1 ? (kBlockDim / pipeline_factor) : kBlockDim;
     float* JXL_RESTRICT idct_row[3];
+    size_t idct_buf_ysize[3];
     int16_t* JXL_RESTRICT jpeg_row[3];
     for (size_t c = 0; c < 3; c++) {
       const auto& buffer = render_pipeline_input.GetBuffer(c);
-      idct_row[c] = buffer.second.Row(buffer.first, sby[c] * kBlockDim);
+      idct_row[c] =
+          buffer.second.Row(buffer.first, sby[c] * pipeline_block_dim);
+      idct_buf_ysize[c] = buffer.second.ysize();
       if (jpeg_data) {
         auto& component = jpeg_data->components[jpeg_c_map[c]];
         jpeg_row[c] =
@@ -443,10 +475,84 @@ Status DecodeGroupImpl(const FrameHeader& frame_header,
             if ((sbx[c] << hshift[c] != bx) || (sby[c] << vshift[c] != by)) {
               continue;
             }
-            // IDCT
-            float* JXL_RESTRICT idct_pos = idct_row[c] + sbx[c] * kBlockDim;
-            TransformToPixels(acs.Strategy(), block + c * size, idct_pos,
-                              idct_stride[c], group_dec_cache->scratch_space);
+            const size_t preview_factor =
+                dec_state->pipeline_input_downsampling;
+            const bool use_reduced_preview = preview_factor > 1;
+            float* JXL_RESTRICT idct_pos =
+                idct_row[c] + sbx[c] * pipeline_block_dim;
+            const size_t reduced_xsize =
+                acs.covered_blocks_x() * kBlockDim / preview_factor;
+            const size_t reduced_ysize =
+                acs.covered_blocks_y() * kBlockDim / preview_factor;
+            const size_t reduced_area = reduced_xsize * reduced_ysize;
+            const size_t aligned_reduced_area = (reduced_area + 15) & ~15;
+            // Scratch space layout (from group_dec_cache, total
+            // 4*max_block_area floats, where max_block_area = max(ROWS*COLS)
+            // over all strategies):
+            //
+            //   Native reduced path (have_native_reduced == true):
+            //     [0, aligned_reduced_area)     : reduced pixel output
+            //     [aligned_reduced_area, ...)    : coefficient block + IDCT tmp
+            //     Total: ≤ max_block_area/4 + max_block_area/4 + IDCT tmp.
+            //
+            //   Fallback path (have_native_reduced == false):
+            //     [0, max_block_area)            : full-size pixel output
+            //     [max_block_area, ...)           : IDCT scratch, then
+            //     downsample Total: max_block_area + ≤ 2*max_block_area for
+            //     IDCT.
+            //
+            // Both paths fit comfortably within the 4*max_block_area budget.
+            if (!use_reduced_preview) {
+              TransformToPixels(acs.Strategy(), block + c * size, idct_pos,
+                                idct_stride[c], group_dec_cache->scratch_space);
+              continue;
+            }
+            const bool have_native_reduced = TransformToReducedPixels(
+                acs.Strategy(), block + c * size, preview_factor,
+                /*pixels=*/group_dec_cache->scratch_space,
+                /*pixels_stride=*/reduced_xsize,
+                /*scratch=*/group_dec_cache->scratch_space +
+                    aligned_reduced_area);
+            JXL_DASSERT(aligned_reduced_area + acs.covered_blocks_x() *
+                                                   acs.covered_blocks_y() *
+                                                   kDCTBlockSize <=
+                        group_dec_cache->scratch_space_floats());
+            if (!have_native_reduced) {
+              const size_t full_xsize = acs.covered_blocks_x() * kBlockDim;
+              const size_t full_ysize = acs.covered_blocks_y() * kBlockDim;
+              JXL_DASSERT(full_xsize * full_ysize + acs.covered_blocks_x() *
+                                                        acs.covered_blocks_y() *
+                                                        kDCTBlockSize <=
+                          group_dec_cache->scratch_space_floats());
+              TransformToPixels(acs.Strategy(), block + c * size,
+                                /*pixels=*/group_dec_cache->scratch_space,
+                                /*pixels_stride=*/full_xsize,
+                                /*scratch=*/group_dec_cache->scratch_space +
+                                    full_xsize * full_ysize);
+              DownsamplePixels(
+                  group_dec_cache->scratch_space, full_xsize, full_ysize,
+                  full_xsize, preview_factor,
+                  group_dec_cache->scratch_space + full_xsize * full_ysize,
+                  reduced_xsize);
+            }
+            const float* JXL_RESTRICT reduced_pixels =
+                have_native_reduced
+                    ? group_dec_cache->scratch_space
+                    : group_dec_cache->scratch_space +
+                          acs.covered_blocks_x() * acs.covered_blocks_y() *
+                              kDCTBlockSize;
+            const size_t sby_in_buf = sby[c] * pipeline_block_dim;
+            const size_t avail_rows = sby_in_buf < idct_buf_ysize[c]
+                                          ? idct_buf_ysize[c] - sby_in_buf
+                                          : 0;
+            // The render pipeline input is at the reduced resolution, so the
+            // reduced pixels are copied into it unchanged.
+            const size_t clamped_ysize = std::min(reduced_ysize, avail_rows);
+            for (size_t y = 0; y < clamped_ysize; ++y) {
+              memcpy(idct_pos + y * idct_stride[c],
+                     reduced_pixels + y * reduced_xsize,
+                     reduced_xsize * sizeof(*reduced_pixels));
+            }
           }
         }
         bx += llf_x;
@@ -727,8 +833,20 @@ Status DecodeGroup(const FrameHeader& frame_header,
     *should_run_pipeline = draw != kDontDraw;
   }
 
-  if (draw == kDraw && num_passes == 0 && first_pass == 0) {
+  // Drawing from the DC alone (a progressive preview flushed before any AC
+  // pass): the DC is upsampled 8x, as the AC would be if it were all zero. At
+  // reduced pipeline resolution (factors 2 and 4), the upsampled rows of each
+  // DC row go to a scratch buffer and are box-averaged into the pipeline
+  // input, which is the full resolution rendering downsampled. At factor 8
+  // the DC (the block averages) is copied below instead.
+  const size_t dc_downsampling = dec_state->pipeline_input_downsampling;
+  if (draw == kDraw && num_passes == 0 && first_pass == 0 &&
+      dc_downsampling < kBlockDim) {
+    JXL_ENSURE(kBlockDim % dc_downsampling == 0);
     JXL_RETURN_IF_ERROR(group_dec_cache->InitDCBufferOnce(memory_manager));
+    if (dc_downsampling > 1) {
+      JXL_RETURN_IF_ERROR(group_dec_cache->InitDCUpsampledOnce(memory_manager));
+    }
     const YCbCrChromaSubsampling& cs = frame_header.chroma_subsampling;
     for (size_t c : {0, 1, 2}) {
       size_t hs = cs.HShift(c);
@@ -779,13 +897,78 @@ Status DecodeGroup(const FrameHeader& frame_header,
         }
         for (size_t iy = 0; iy < 8; iy++) {
           output_rows[0][iy] =
-              dst_rect.Row(upsampling_dst, ((y - src_rect.y0()) << 3) + iy) -
-              kRenderPipelineXOffset;
+              dc_downsampling == 1
+                  ? dst_rect.Row(upsampling_dst,
+                                 ((y - src_rect.y0()) << 3) + iy) -
+                        kRenderPipelineXOffset
+                  : group_dec_cache->dc_upsampled.Row(iy);
         }
         // Arguments set to 0/nullptr are not used.
         JXL_RETURN_IF_ERROR(dec_state->upsampler8x->ProcessRow(
             input_rows, output_rows, /*xextra_left=*/0, /*xextra_right=*/0,
             src_rect.xsize(), 0, 0, thread));
+        if (dc_downsampling == 1) continue;
+        const size_t f = dc_downsampling;
+        const float scale = 1.0f / (f * f);
+        const size_t out_y0 = (y - src_rect.y0()) * (kBlockDim / f);
+        if (out_y0 >= dst_rect.ysize()) break;
+        const size_t out_ysize =
+            std::min(kBlockDim / f, dst_rect.ysize() - out_y0);
+        const size_t out_xsize =
+            std::min(src_rect.xsize() * (kBlockDim / f), dst_rect.xsize());
+        for (size_t oy = 0; oy < out_ysize; oy++) {
+          float* JXL_RESTRICT out = dst_rect.Row(upsampling_dst, out_y0 + oy);
+          for (size_t ox = 0; ox < out_xsize; ox++) {
+            float sum = 0.0f;
+            for (size_t iy = 0; iy < f; iy++) {
+              const float* JXL_RESTRICT row =
+                  group_dec_cache->dc_upsampled.ConstRow(oy * f + iy) +
+                  kRenderPipelineXOffset + ox * f;
+              for (size_t ix = 0; ix < f; ix++) sum += row[ix];
+            }
+            out[ox] = sum * scale;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  // DC-only drawing at 1/8 pipeline resolution: the DC holds one value per
+  // pipeline pixel. We cannot fall through to DecodeGroupImpl because AC
+  // strategy / quant fields have not been initialized yet.
+  if (draw == kDraw && num_passes == 0 && first_pass == 0 &&
+      dec_state->pipeline_input_downsampling > 1) {
+    const size_t factor = dec_state->pipeline_input_downsampling;
+    JXL_ENSURE(factor == kBlockDim);
+    const size_t reduced_block_dim = kBlockDim / factor;
+    const YCbCrChromaSubsampling& cs = frame_header.chroma_subsampling;
+    const Rect block_rect =
+        dec_state->shared->frame_dim.BlockGroupRect(group_idx);
+    for (size_t c : {0, 1, 2}) {
+      size_t hs = cs.HShift(c);
+      size_t vs = cs.VShift(c);
+      const Rect src_rect(block_rect.x0() >> hs, block_rect.y0() >> vs,
+                          block_rect.xsize() >> hs, block_rect.ysize() >> vs);
+      const auto& buffer = render_pipeline_input.GetBuffer(c);
+      Rect dst_rect = buffer.second;
+      ImageF* dst = buffer.first;
+      for (size_t by = 0; by < src_rect.ysize(); ++by) {
+        const float* dc_row =
+            src_rect.ConstPlaneRow(*dec_state->shared->dc, c, by);
+        for (size_t bx = 0; bx < src_rect.xsize(); ++bx) {
+          const float dc_val = dc_row[bx];
+          for (size_t ry = 0; ry < reduced_block_dim; ++ry) {
+            size_t out_y = by * reduced_block_dim + ry;
+            if (out_y >= dst_rect.ysize()) break;
+            float* out = dst_rect.Row(dst, out_y);
+            for (size_t rx = 0; rx < reduced_block_dim; ++rx) {
+              size_t out_x = bx * reduced_block_dim + rx;
+              if (out_x >= dst_rect.xsize()) break;
+              out[out_x] = dc_val;
+            }
+          }
+        }
       }
     }
     return true;
@@ -804,7 +987,6 @@ Status DecodeGroup(const FrameHeader& frame_header,
       frame_header, readers, num_passes, group_idx, histo_selector_bits,
       dec_state->shared->frame_dim.BlockGroupRect(group_idx), group_dec_cache,
       dec_state, first_pass));
-
   JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(DecodeGroupImpl)(
       frame_header, get_block.get(), group_dec_cache, dec_state, thread,
       group_idx, render_pipeline_input, jpeg_data, draw));

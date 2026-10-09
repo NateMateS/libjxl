@@ -15,6 +15,7 @@
 #define LIB_JXL_DEC_TRANSFORMS_INL_H_
 #endif
 
+#include <cmath>
 #include <cstddef>
 #include <hwy/highway.h>
 
@@ -28,6 +29,49 @@ namespace {
 
 // These templates are not found via ADL.
 using hwy::HWY_NAMESPACE::MulAdd;
+
+template <size_t DCT_ROWS, size_t DCT_COLS, size_t OUT_ROWS, size_t OUT_COLS>
+JXL_INLINE void TransformToReducedPixelsDCT(
+    const float* JXL_RESTRICT coefficients, float* JXL_RESTRICT pixels,
+    size_t pixels_stride, float* JXL_RESTRICT scratch_space) {
+  const auto resample_scale = [](size_t from, size_t to, size_t index) {
+    constexpr double kPi = 3.14159265358979323846264338327950288;
+    double scale = 1.0;
+    while (from > to) {
+      scale *= std::cos((static_cast<double>(index) * kPi) /
+                        (2.0 * static_cast<double>(from)));
+      from >>= 1;
+    }
+    return static_cast<float>(scale);
+  };
+  float* JXL_RESTRICT block = scratch_space;
+  size_t block_size = std::max<size_t>(128, OUT_ROWS * OUT_COLS + 64);
+  block_size = (block_size + 15) & ~15;
+  memset(block, 0, block_size * sizeof(float));
+  // Same layout convention as ComputeScaledIDCT: when ROWS < COLS the
+  // coefficients are stored as [vertical freq][horizontal freq], otherwise
+  // transposed, with stride ROWS. The reduced block keeps the orientation, so
+  // the stride changes from DCT_* to OUT_*.
+  if (DCT_ROWS < DCT_COLS) {
+    for (size_t v = 0; v < OUT_ROWS; ++v) {
+      const float v_scale = resample_scale(DCT_ROWS, OUT_ROWS, v);
+      for (size_t h = 0; h < OUT_COLS; ++h) {
+        block[v * OUT_COLS + h] = coefficients[v * DCT_COLS + h] * v_scale *
+                                  resample_scale(DCT_COLS, OUT_COLS, h);
+      }
+    }
+  } else {
+    for (size_t h = 0; h < OUT_COLS; ++h) {
+      const float h_scale = resample_scale(DCT_COLS, OUT_COLS, h);
+      for (size_t v = 0; v < OUT_ROWS; ++v) {
+        block[h * OUT_ROWS + v] = coefficients[h * DCT_ROWS + v] * h_scale *
+                                  resample_scale(DCT_ROWS, OUT_ROWS, v);
+      }
+    }
+  }
+  ComputeScaledIDCT<OUT_ROWS, OUT_COLS>()(block, DCTTo(pixels, pixels_stride),
+                                          scratch_space + block_size);
+}
 
 // Computes the lowest-frequency LF_ROWSxLF_COLS-sized square in output, which
 // is a DCT_ROWS*DCT_COLS-sized DCT block, by doing a ROWS*COLS DCT on the
@@ -685,6 +729,346 @@ HWY_MAYBE_UNUSED void TransformToPixels(const AcStrategyType strategy,
                                     scratch_space);
       break;
     }
+  }
+}
+
+HWY_MAYBE_UNUSED bool TransformToReducedPixels(const AcStrategyType strategy,
+                                               const float* coefficients,
+                                               size_t factor,
+                                               float* JXL_RESTRICT pixels,
+                                               size_t pixels_stride,
+                                               float* JXL_RESTRICT scratch) {
+  if (factor == 1) {
+    return false;
+  }
+  using Type = AcStrategyType;
+  switch (strategy) {
+    case Type::DCT: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<8, 8, 4, 4>(coefficients, pixels,
+                                                pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<8, 8, 2, 2>(coefficients, pixels,
+                                                pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<8, 8, 1, 1>(coefficients, pixels,
+                                                pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT16X16: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<16, 16, 8, 8>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<16, 16, 4, 4>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<16, 16, 2, 2>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT16X8: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<16, 8, 8, 4>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<16, 8, 4, 2>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<16, 8, 2, 1>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT8X16: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<8, 16, 4, 8>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<8, 16, 2, 4>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<8, 16, 1, 2>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT32X8: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<32, 8, 16, 4>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<32, 8, 8, 2>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<32, 8, 4, 1>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT8X32: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<8, 32, 4, 16>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<8, 32, 2, 8>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<8, 32, 1, 4>(coefficients, pixels,
+                                                 pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT32X16: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<32, 16, 16, 8>(coefficients, pixels,
+                                                   pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<32, 16, 8, 4>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<32, 16, 4, 2>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT16X32: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<16, 32, 8, 16>(coefficients, pixels,
+                                                   pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<16, 32, 4, 8>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<16, 32, 2, 4>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT32X32: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<32, 32, 16, 16>(coefficients, pixels,
+                                                    pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<32, 32, 8, 8>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<32, 32, 4, 4>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT64X32: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<64, 32, 32, 16>(coefficients, pixels,
+                                                    pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<64, 32, 16, 8>(coefficients, pixels,
+                                                   pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<64, 32, 8, 4>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT32X64: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<32, 64, 16, 32>(coefficients, pixels,
+                                                    pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<32, 64, 8, 16>(coefficients, pixels,
+                                                   pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<32, 64, 4, 8>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT64X64: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<64, 64, 32, 32>(coefficients, pixels,
+                                                    pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<64, 64, 16, 16>(coefficients, pixels,
+                                                    pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<64, 64, 8, 8>(coefficients, pixels,
+                                                  pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT128X64: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<128, 64, 64, 32>(coefficients, pixels,
+                                                     pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<128, 64, 32, 16>(coefficients, pixels,
+                                                     pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<128, 64, 16, 8>(coefficients, pixels,
+                                                    pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT64X128: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<64, 128, 32, 64>(coefficients, pixels,
+                                                     pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<64, 128, 16, 32>(coefficients, pixels,
+                                                     pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<64, 128, 8, 16>(coefficients, pixels,
+                                                    pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT128X128: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<128, 128, 64, 64>(coefficients, pixels,
+                                                      pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<128, 128, 32, 32>(coefficients, pixels,
+                                                      pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<128, 128, 16, 16>(coefficients, pixels,
+                                                      pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT256X128: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<256, 128, 128, 64>(coefficients, pixels,
+                                                       pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<256, 128, 64, 32>(coefficients, pixels,
+                                                      pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<256, 128, 32, 16>(coefficients, pixels,
+                                                      pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT128X256: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<128, 256, 64, 128>(coefficients, pixels,
+                                                       pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<128, 256, 32, 64>(coefficients, pixels,
+                                                      pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<128, 256, 16, 32>(coefficients, pixels,
+                                                      pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    case Type::DCT256X256: {
+      if (factor == 2) {
+        TransformToReducedPixelsDCT<256, 256, 128, 128>(coefficients, pixels,
+                                                        pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 4) {
+        TransformToReducedPixelsDCT<256, 256, 64, 64>(coefficients, pixels,
+                                                      pixels_stride, scratch);
+        return true;
+      }
+      if (factor == 8) {
+        TransformToReducedPixelsDCT<256, 256, 32, 32>(coefficients, pixels,
+                                                      pixels_stride, scratch);
+        return true;
+      }
+      return false;
+    }
+    default:
+      return false;
   }
 }
 

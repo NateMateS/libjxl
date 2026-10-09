@@ -56,6 +56,16 @@ class FrameDecoder {
 
   void SetRenderSpotcolors(bool rsc) { render_spotcolors_ = rsc; }
   void SetCoalescing(bool c) { coalescing_ = c; }
+  void SetPreviewDestructiveFlush(bool enabled) {
+    preview_destructive_flush_ = enabled;
+  }
+  void SetPreviewNativePaths(bool allow_native_reduced_input,
+                             bool allow_native_fused_upsampling,
+                             bool allow_native_dc_only) {
+    allow_native_reduced_input_ = allow_native_reduced_input;
+    allow_native_fused_upsampling_ = allow_native_fused_upsampling;
+    allow_native_dc_only_ = allow_native_dc_only;
+  }
 
   // Read FrameHeader and table of contents from the given BitReader.
   Status InitFrame(BitReader* JXL_RESTRICT br, ImageBundle* decoded,
@@ -123,10 +133,21 @@ class FrameDecoder {
   const std::vector<TocEntry>& Toc() const { return toc_; }
 
   const FrameHeader& GetFrameHeader() const { return frame_header_; }
+  JxlImageOutDownsamplingMethod GetDownsamplingMethod() const {
+    return dec_state_->downsampling_method;
+  }
+  // Whether this frame is rendered from its DC alone (a 1/8 preview). Such a
+  // frame is complete once the DC is decoded; its AC sections are never
+  // decoded and the caller must skip them.
+  bool IsDCOnlyFrame() const {
+    return dec_state_->downsampling_method ==
+           JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_DC_ONLY;
+  }
 
   // Returns whether a DC image has been decoded, accessible at low resolution
   // at passes.shared_storage.dc_storage
   bool HasDecodedDC() const { return finalized_dc_; }
+  bool HasProgressivePreview() const { return progressive_preview_available_; }
   bool HasDecodedAll() const { return toc_.size() == num_sections_done_; }
 
   size_t NumCompletePasses() const {
@@ -142,25 +163,20 @@ class FrameDecoder {
   // to check the true finished state.
   // Returns the progressive detail that will be effective for the frame.
   JxlProgressiveDetail SetPauseAtProgressive(JxlProgressiveDetail prog_detail) {
+    passes_to_pause_.clear();
     bool single_section =
         frame_dim_.num_groups == 1 && frame_header_.passes.num_passes == 1;
     if (frame_header_.frame_type != kSkipProgressive &&
         // If there's only one group and one pass, there is no separate section
         // for DC and the entire full resolution image is available at once.
         !single_section &&
-        // If extra channels are encoded with modular without squeeze, they
-        // don't support DC. If the are encoded with squeeze, DC works in theory
-        // but the implementation may not yet correctly support this for Flush.
-        // Therefore, can't correctly pause for a progressive step if there is
-        // an extra channel (including alpha channel)
-        // TODO(firsching): Check if this is still the case.
-        decoded_->metadata()->extra_channel_info.empty() &&
-        // DC is not guaranteed to be available in modular mode and may be a
-        // black image. If squeeze is used, it may be available depending on the
-        // current implementation.
-        // TODO(lode): do return DC if it's known that flushing at this point
-        // will produce a valid 1/8th downscaled image with modular encoding.
-        frame_header_.encoding == FrameEncoding::kVarDCT) {
+        // Extra channels (alpha etc.) are zero-filled during progressive flush
+        // for VarDCT, producing a fully-transparent preview. Block progressive
+        // for VarDCT+alpha until proper EC flush support is added.
+        // Modular frames are admitted here; ProcessSections keeps only their
+        // steps that render the whole frame (squeezed) once the DC is decoded.
+        (frame_header_.encoding == FrameEncoding::kModular ||
+         decoded_->metadata()->extra_channel_info.empty())) {
       progressive_detail_ = prog_detail;
     } else {
       progressive_detail_ = JxlProgressiveDetail::kFrames;
@@ -186,6 +202,14 @@ class FrameDecoder {
                                          : std::numeric_limits<size_t>::max());
   }
 
+  // Whether decoding pauses once `num_passes` passes are complete. A modular
+  // frame drops the pauses that are not progression steps once its DC is
+  // decoded.
+  bool PausesAfterPasses(size_t num_passes) const {
+    return std::binary_search(passes_to_pause_.begin(), passes_to_pause_.end(),
+                              static_cast<int>(num_passes));
+  }
+
   // Sets the pixel callback or image buffer where the pixels will be decoded.
   //
   // @param undo_orientation: if true, indicates the frame decoder should apply
@@ -193,10 +217,15 @@ class FrameDecoder {
   // orientation.
   Status SetImageOutput(const PixelCallback& pixel_callback, void* image_buffer,
                         size_t image_buffer_size, size_t xsize, size_t ysize,
-                        JxlPixelFormat format, size_t bits_per_sample,
-                        bool unpremul_alpha, bool undo_orientation) const {
+                        size_t full_xsize, size_t full_ysize,
+                        size_t output_downsampling, JxlPixelFormat format,
+                        size_t bits_per_sample, bool unpremul_alpha,
+                        bool undo_orientation) const {
     dec_state_->width = xsize;
     dec_state_->height = ysize;
+    dec_state_->full_output_width = full_xsize;
+    dec_state_->full_output_height = full_ysize;
+    dec_state_->output_downsampling = output_downsampling;
     dec_state_->main_output.format = format;
     dec_state_->main_output.bits_per_sample = bits_per_sample;
     dec_state_->main_output.callback = pixel_callback;
@@ -212,7 +241,10 @@ class FrameDecoder {
     if (undo_orientation) {
       dec_state_->undo_orientation = decoded_->metadata()->GetOrientation();
       if (static_cast<int>(dec_state_->undo_orientation) > 4) {
+        // The output stage works in frame (pre-orientation) coordinates.
         std::swap(dec_state_->width, dec_state_->height);
+        std::swap(dec_state_->full_output_width,
+                  dec_state_->full_output_height);
       }
     }
     dec_state_->extra_output.clear();
@@ -326,6 +358,10 @@ class FrameDecoder {
   ModularFrameDecoder modular_frame_decoder_;
   bool render_spotcolors_ = true;
   bool coalescing_ = true;
+  bool preview_destructive_flush_ = false;
+  bool allow_native_reduced_input_ = true;
+  bool allow_native_fused_upsampling_ = true;
+  bool allow_native_dc_only_ = true;
 
   std::vector<uint8_t> processed_section_;
   std::vector<uint8_t> decoded_passes_per_ac_group_;
@@ -333,7 +369,8 @@ class FrameDecoder {
   bool decoded_dc_global_;
   bool decoded_ac_global_;
   bool HasEverything() const;
-  bool finalized_dc_ = true;
+  bool finalized_dc_ = false;
+  bool progressive_preview_available_ = false;
   size_t num_sections_done_ = 0;
   bool is_finalized_ = true;
   bool allocated_ = false;

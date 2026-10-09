@@ -34,6 +34,7 @@
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/dec_bit_reader.h"
 #include "lib/jxl/dec_cache.h"
+#include "lib/jxl/dec_preview_internal.h"
 #include "lib/jxl/image_metadata.h"
 #include "lib/jxl/jpeg/jpeg_data.h"
 #include "lib/jxl/padded_bytes.h"
@@ -433,6 +434,24 @@ struct JxlDecoder {
   bool coalescing;
   float desired_intensity_target;
 
+  // Optional decoder-side image / extra-channel output downsampling. Like the
+  // flags below, it applies to the frame announced by JXL_DEC_FRAME and is
+  // released with that frame's outputs (ReleaseFrameOutputs).
+  size_t image_out_downsampling = 1;
+  // Preview callers that stop immediately after a successful flush can allow
+  // modular flush to reuse frame storage instead of preserving it.
+  bool prefer_preview_inplace_flush = false;
+  bool allow_preview_native_reduced_input = true;
+  bool allow_preview_native_fused_upsampling = true;
+  bool allow_preview_native_dc_only = true;
+  // Set once a frame decoded with prefer_preview_inplace_flush was flushed or
+  // completed: its storage may have been reused and it may not have been saved
+  // for later frames, so decoding cannot continue until a rewind.
+  bool preview_decoding_ended = false;
+  // Set after a frame rendered from its DC alone: the rest of that frame
+  // (remaining_frame_size bytes) is skipped when decoding continues.
+  bool skip_rest_of_frame = false;
+
   // Bitfield, for which informative events (JXL_DEC_BASIC_INFO, etc...) the
   // decoder returns a status. By default, do not return for any of the events,
   // only return when the decoder cannot continue because it needs more input or
@@ -786,6 +805,15 @@ void JxlDecoderRewindDecodingState(JxlDecoder* dec) {
   dec->have_container = false;
   dec->box_count = 0;
   dec->downsampling_target = 8;
+  // Preview settings are configured per frame, after JXL_DEC_FRAME and before
+  // the frame's outputs are set, so they must not leak across rewinds.
+  dec->image_out_downsampling = 1;
+  dec->prefer_preview_inplace_flush = false;
+  dec->allow_preview_native_reduced_input = true;
+  dec->allow_preview_native_fused_upsampling = true;
+  dec->allow_preview_native_dc_only = true;
+  dec->preview_decoding_ended = false;
+  dec->skip_rest_of_frame = false;
   dec->image_out_buffer_set = false;
   dec->image_out_buffer = nullptr;
   dec->image_out_init_callback = nullptr;
@@ -901,6 +929,22 @@ void JxlDecoderSkipFrames(JxlDecoder* dec, size_t amount) {
   }
 }
 
+namespace {
+// The outputs of the frame announced by JXL_DEC_FRAME, and the preview
+// settings that shape them, end with that frame (whether it was decoded or
+// skipped): the next frame starts as if none had been set. Their setters are
+// refused until the next JXL_DEC_FRAME, so nothing set for that frame is lost.
+void ReleaseFrameOutputs(JxlDecoder* dec) {
+  dec->image_out_buffer_set = false;
+  dec->extra_channel_output.clear();
+  dec->image_out_downsampling = 1;
+  dec->prefer_preview_inplace_flush = false;
+  dec->allow_preview_native_reduced_input = true;
+  dec->allow_preview_native_fused_upsampling = true;
+  dec->allow_preview_native_dc_only = true;
+}
+}  // namespace
+
 JxlDecoderStatus JxlDecoderSkipCurrentFrame(JxlDecoder* dec) {
   if (dec->frame_stage != FrameStage::kFull) {
     return JXL_API_ERROR("JxlDecoderSkipCurrentFrame called at the wrong time");
@@ -909,7 +953,7 @@ JxlDecoderStatus JxlDecoderSkipCurrentFrame(JxlDecoder* dec) {
   dec->frame_stage = FrameStage::kHeader;
   dec->AdvanceCodestream(dec->remaining_frame_size);
   if (dec->is_last_of_still) {
-    dec->image_out_buffer_set = false;
+    ReleaseFrameOutputs(dec);
   }
   return JXL_DEC_SUCCESS;
 }
@@ -979,8 +1023,10 @@ JxlDecoderStatus JxlDecoderSetCoalescing(JxlDecoder* dec, JXL_BOOL coalescing) {
 }
 
 namespace {
-// helper function to get the dimensions of the current image buffer
-void GetCurrentDimensions(const JxlDecoder* dec, size_t& xsize, size_t& ysize) {
+// helper function to get the dimensions of the current image buffer, at the
+// given output downsampling
+void GetCurrentDimensions(const JxlDecoder* dec, size_t downsampling,
+                          size_t& xsize, size_t& ysize) {
   if (dec->frame_header->nonserialized_is_preview) {
     xsize = dec->metadata.oriented_preview_xsize(dec->keep_orientation);
     ysize = dec->metadata.oriented_preview_ysize(dec->keep_orientation);
@@ -997,6 +1043,42 @@ void GetCurrentDimensions(const JxlDecoder* dec, size_t& xsize, size_t& ysize) {
       std::swap(xsize, ysize);
     }
   }
+  xsize = jxl::DivCeil(xsize, downsampling);
+  ysize = jxl::DivCeil(ysize, downsampling);
+}
+
+// Whether the current frame is the one announced by JXL_DEC_FRAME, as opposed
+// to the embedded preview or a frame decoded only for later frames to use (a
+// DC frame, a reference-only frame, a layer blended into the next one). Valid
+// from the frame header until the next one is read.
+bool IsDisplayedFrame(const JxlDecoder* dec) {
+  return !dec->preview_frame && dec->is_last_of_still && !dec->skipping_frame;
+}
+
+// The output buffers were checked when they were set, possibly before the
+// current frame header was read; checks them against the output size of the
+// frame about to be written.
+JxlDecoderStatus CheckOutputBufferSizes(const JxlDecoder* dec) {
+  size_t min_size;
+  if (dec->image_out_buffer != nullptr) {
+    JxlDecoderStatus status =
+        JxlDecoderImageOutBufferSize(dec, &dec->image_out_format, &min_size);
+    if (status != JXL_DEC_SUCCESS) return status;
+    if (dec->image_out_size < min_size) {
+      return JXL_API_ERROR("image output buffer too small for this frame");
+    }
+  }
+  for (size_t i = 0; i < dec->extra_channel_output.size(); ++i) {
+    const auto& extra = dec->extra_channel_output[i];
+    if (extra.buffer == nullptr) continue;
+    JxlDecoderStatus status = JxlDecoderExtraChannelBufferSize(
+        dec, &extra.format, &min_size, static_cast<uint32_t>(i));
+    if (status != JXL_DEC_SUCCESS) return status;
+    if (extra.buffer_size < min_size) {
+      return JXL_API_ERROR("extra channel buffer too small for this frame");
+    }
+  }
+  return JXL_DEC_SUCCESS;
 }
 }  // namespace
 
@@ -1269,6 +1351,13 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
 
   // Handle frames
   for (;;) {
+    if (dec->skip_rest_of_frame) {
+      // Done lazily, so that a caller stopping after a DC-only frame has not
+      // consumed the frame's undecoded AC data.
+      dec->skip_rest_of_frame = false;
+      dec->AdvanceCodestream(dec->remaining_frame_size);
+      dec->remaining_frame_size = 0;
+    }
     bool parse_frames =
         (dec->events_wanted &
          (JXL_DEC_PREVIEW_IMAGE | JXL_DEC_FRAME | JXL_DEC_FULL_IMAGE));
@@ -1461,10 +1550,21 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
         }
       }
 
+      const bool displayed_frame = IsDisplayedFrame(dec);
       if (dec->image_out_buffer_set) {
+        JXL_API_RETURN_IF_ERROR(CheckOutputBufferSizes(dec));
         size_t xsize;
         size_t ysize;
-        GetCurrentDimensions(dec, xsize, ysize);
+        size_t full_xsize;
+        size_t full_ysize;
+        GetCurrentDimensions(dec, dec->image_out_downsampling, xsize, ysize);
+        GetCurrentDimensions(dec, /*downsampling=*/1, full_xsize, full_ysize);
+        // The output downsampling applies to the frame JXL_DEC_FRAME announced.
+        // A frame decoded only for later frames, which can have the output when
+        // it was set early, is rendered without it, as their data must be: the
+        // writer clips it to the output dimensions.
+        const size_t output_downsampling =
+            displayed_frame ? dec->image_out_downsampling : 1;
         size_t bits_per_sample = GetBitDepth(
             dec->image_out_bit_depth, dec->metadata.m, dec->image_out_format);
         JXL_API_RETURN_IF_ERROR(dec->frame_dec->SetImageOutput(
@@ -1472,8 +1572,9 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
                 dec->image_out_init_callback, dec->image_out_run_callback,
                 dec->image_out_destroy_callback, dec->image_out_init_opaque},
             reinterpret_cast<uint8_t*>(dec->image_out_buffer),
-            dec->image_out_size, xsize, ysize, dec->image_out_format,
-            bits_per_sample, dec->unpremul_alpha, !dec->keep_orientation));
+            dec->image_out_size, xsize, ysize, full_xsize, full_ysize,
+            output_downsampling, dec->image_out_format, bits_per_sample,
+            dec->unpremul_alpha, !dec->keep_orientation));
         for (size_t i = 0; i < dec->extra_channel_output.size(); ++i) {
           const auto& extra = dec->extra_channel_output[i];
           size_t ec_bits_per_sample =
@@ -1484,23 +1585,42 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
               ec_bits_per_sample));
         }
       }
+      // The preview options can be set until the frame's output is, and are
+      // read when the frame's pipeline is prepared, in the first call below.
+      // Reference saving may only be skipped for the frame the caller stops
+      // after; the frames it depends on are decoded first.
+      dec->frame_dec->SetPreviewDestructiveFlush(
+          displayed_frame && dec->prefer_preview_inplace_flush);
+      dec->frame_dec->SetPreviewNativePaths(
+          dec->allow_preview_native_reduced_input,
+          dec->allow_preview_native_fused_upsampling,
+          dec->allow_preview_native_dc_only);
 
       size_t next_num_passes_to_pause = dec->frame_dec->NextNumPassesToPause();
 
       JXL_API_RETURN_IF_ERROR(JxlDecoderProcessSections(dec));
 
-      bool all_sections_done = dec->frame_dec->HasDecodedAll();
-      bool got_dc_only = !all_sections_done && dec->frame_dec->HasDecodedDC();
+      // A frame rendered from its DC alone (a 1/8 output preview) is complete
+      // as soon as its DC is decoded: the frame decoder only chooses this once
+      // the DC is finalized, and leaves the AC sections undecoded.
+      const bool dc_only_frame = dec->frame_dec->IsDCOnlyFrame();
+      bool all_sections_done = dc_only_frame || dec->frame_dec->HasDecodedAll();
+      bool got_progressive_preview =
+          !all_sections_done && dec->frame_dec->HasProgressivePreview();
 
       if (dec->frame_prog_detail >= JxlProgressiveDetail::kDC &&
-          !dec->dc_frame_progression_done && got_dc_only) {
+          !dec->dc_frame_progression_done && got_progressive_preview) {
         dec->dc_frame_progression_done = true;
         dec->downsampling_target = 8;
         return JXL_DEC_FRAME_PROGRESSION;
       }
 
+      // The target can predate the call that drops a modular frame's steps
+      // (see FrameDecoder::ProcessSections).
       bool new_progression_step_done =
-          dec->frame_dec->NumCompletePasses() >= next_num_passes_to_pause;
+          dec->frame_dec->NumCompletePasses() >= next_num_passes_to_pause &&
+          dec->frame_dec->PausesAfterPasses(
+              dec->frame_dec->NumCompletePasses());
 
       if (!all_sections_done &&
           dec->frame_prog_detail >= JxlProgressiveDetail::kLastPasses &&
@@ -1528,9 +1648,19 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
             dec->frame_dec->References();
       }
 
+      if (dc_only_frame) {
+        // No group has been rendered yet: render the frame from its DC.
+        if (!dec->frame_dec->Flush()) {
+          return JXL_INPUT_ERROR("rendering the frame from its DC failed");
+        }
+      }
+
       if (!dec->frame_dec->FinalizeFrame()) {
         return JXL_INPUT_ERROR("decoding frame failed");
       }
+      // The undecoded AC sections of a DC-only frame are skipped before the
+      // next frame header or box is read.
+      dec->skip_rest_of_frame = dc_only_frame;
 #if JPEGXL_ENABLE_TRANSCODE_JPEG
       // If jpeg output was requested, we merely return the JXL_DEC_FULL_IMAGE
       // status without outputting pixels.
@@ -1541,8 +1671,10 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
       }
 #endif
       if (dec->preview_frame || dec->is_last_of_still) {
-        dec->image_out_buffer_set = false;
-        dec->extra_channel_output.clear();
+        if (IsDisplayedFrame(dec) && dec->prefer_preview_inplace_flush) {
+          dec->preview_decoding_ended = true;
+        }
+        ReleaseFrameOutputs(dec);
       }
     }
 
@@ -2169,6 +2301,12 @@ JxlDecoderStatus JxlDecoderProcessInput(JxlDecoder* dec) {
         "Cannot keep using decoder after it encountered an error, use "
         "JxlDecoderReset to reset it");
   }
+  if (dec->preview_decoding_ended) {
+    return JXL_API_ERROR(
+        "Cannot continue decoding after a frame decoded with "
+        "JxlDecoderSetPreferPreviewInplaceFlush, use JxlDecoderRewind or "
+        "JxlDecoderReset");
+  }
 
   if (!dec->got_signature) {
     JxlSignature sig = JxlSignatureCheck(dec->next_in, dec->avail_in);
@@ -2269,8 +2407,11 @@ JxlDecoderStatus JxlDecoderGetBasicInfo(const JxlDecoder* dec,
     info->num_extra_channels = meta.num_extra_channels;
 
     if (info->have_preview) {
-      info->preview.xsize = dec->metadata.m.preview_size.xsize();
-      info->preview.ysize = dec->metadata.m.preview_size.ysize();
+      // Oriented like xsize and ysize: the dimensions of the preview output.
+      info->preview.xsize =
+          dec->metadata.oriented_preview_xsize(dec->keep_orientation);
+      info->preview.ysize =
+          dec->metadata.oriented_preview_ysize(dec->keep_orientation);
     }
 
     if (info->have_animation) {
@@ -2353,7 +2494,9 @@ JxlDecoderStatus GetColorEncodingForTarget(
     const jxl::ColorEncoding** encoding) {
   if (!dec->got_all_headers) return JXL_DEC_NEED_MORE_INPUT;
   *encoding = nullptr;
-  if (target == JXL_COLOR_PROFILE_TARGET_DATA && dec->metadata.m.xyb_encoded) {
+  // The output encoding is the original one for images that are not XYB
+  // encoded, until JxlDecoderSetOutputColorProfile converts them.
+  if (target == JXL_COLOR_PROFILE_TARGET_DATA) {
     *encoding = &dec->passes_state->output_encoding_info.color_encoding;
   } else {
     *encoding = &dec->metadata.m.color_encoding;
@@ -2462,6 +2605,65 @@ size_t JxlDecoderGetIntendedDownsamplingRatio(JxlDecoder* dec) {
   return dec->downsampling_target;
 }
 
+namespace {
+bool IsValidImageOutDownsampling(size_t factor) {
+  return factor == 1 || factor == 2 || factor == 4 || factor == 8;
+}
+
+// The preview settings apply to the frame announced by JXL_DEC_FRAME. They
+// change the size of its outputs and how it is decoded, so they can only be
+// changed until one of its outputs is set.
+JxlDecoderStatus CheckFrameOutputSettingAllowed(const JxlDecoder* dec,
+                                                const char* setting) {
+  if (dec->frame_stage == FrameStage::kHeader || !IsDisplayedFrame(dec)) {
+    return JXL_API_ERROR(
+        "%s applies to the frame announced by JXL_DEC_FRAME, and must be "
+        "set after that event",
+        setting);
+  }
+  if (dec->image_out_buffer_set) {
+    return JXL_API_ERROR("Must set %s before setting image output", setting);
+  }
+  for (const auto& extra : dec->extra_channel_output) {
+    if (extra.buffer != nullptr) {
+      return JXL_API_ERROR("Must set %s before setting extra channel buffers",
+                           setting);
+    }
+  }
+  return JXL_DEC_SUCCESS;
+}
+}  // namespace
+
+JxlDecoderStatus JxlDecoderSetImageOutDownsampling(JxlDecoder* dec,
+                                                   size_t factor) {
+  JXL_API_RETURN_IF_ERROR(
+      CheckFrameOutputSettingAllowed(dec, "image output downsampling"));
+  if (!IsValidImageOutDownsampling(factor)) {
+    return JXL_API_ERROR(
+        "Image output downsampling must be one of 1, 2, 4 or 8");
+  }
+  dec->image_out_downsampling = factor;
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderGetImageOutDownsamplingMethod(
+    const JxlDecoder* dec, JxlImageOutDownsamplingMethod* method) {
+  if (method == nullptr) {
+    return JXL_API_ERROR("Image output downsampling method output is null");
+  }
+  *method = dec->frame_dec ? dec->frame_dec->GetDownsamplingMethod()
+                           : JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_NONE;
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderSetPreferPreviewInplaceFlush(
+    JxlDecoder* dec, JXL_BOOL prefer_inplace) {
+  JXL_API_RETURN_IF_ERROR(
+      CheckFrameOutputSettingAllowed(dec, "preview flush mode"));
+  dec->prefer_preview_inplace_flush = FROM_JXL_BOOL(prefer_inplace);
+  return JXL_DEC_SUCCESS;
+}
+
 JxlDecoderStatus JxlDecoderFlushImage(JxlDecoder* dec) {
   if (!dec->image_out_buffer_set) return JXL_DEC_ERROR;
   if (dec->frame_stage != FrameStage::kFull) {
@@ -2477,9 +2679,55 @@ JxlDecoderStatus JxlDecoderFlushImage(JxlDecoder* dec) {
   if (!dec->frame_dec->Flush()) {
     return JXL_DEC_ERROR;
   }
+  if (IsDisplayedFrame(dec) && dec->prefer_preview_inplace_flush) {
+    dec->preview_decoding_ended = true;
+  }
 
   return JXL_DEC_SUCCESS;
 }
+
+namespace jxl {
+namespace {
+
+JxlDecoderStatus DecoderSetPreviewNativePaths(JxlDecoder* dec,
+                                              JXL_BOOL allow_reduced_input,
+                                              JXL_BOOL allow_fused_upsampling,
+                                              JXL_BOOL allow_dc_only) {
+  JXL_API_RETURN_IF_ERROR(
+      CheckFrameOutputSettingAllowed(dec, "preview native path selection"));
+  dec->allow_preview_native_reduced_input = FROM_JXL_BOOL(allow_reduced_input);
+  dec->allow_preview_native_fused_upsampling =
+      FROM_JXL_BOOL(allow_fused_upsampling);
+  dec->allow_preview_native_dc_only = FROM_JXL_BOOL(allow_dc_only);
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus DecoderGetFrameEncoding(const JxlDecoder* dec,
+                                         JxlFrameEncoding* encoding) {
+  if (!dec->frame_header || encoding == nullptr) {
+    return JXL_API_ERROR("Frame header not available yet");
+  }
+  switch (dec->frame_header->encoding) {
+    case FrameEncoding::kVarDCT:
+      *encoding = JXL_FRAME_ENCODING_VAR_DCT;
+      return JXL_DEC_SUCCESS;
+    case FrameEncoding::kModular:
+      *encoding = JXL_FRAME_ENCODING_MODULAR;
+      return JXL_DEC_SUCCESS;
+  }
+  *encoding = JXL_FRAME_ENCODING_UNKNOWN;
+  return JXL_DEC_ERROR;
+}
+
+}  // namespace
+
+const JxlDecoderPreviewHooks* GetDecoderPreviewHooks() {
+  static const JxlDecoderPreviewHooks kHooks = {DecoderSetPreviewNativePaths,
+                                                DecoderGetFrameEncoding};
+  return &kHooks;
+}
+
+}  // namespace jxl
 
 JXL_EXPORT JxlDecoderStatus JxlDecoderSetCms(JxlDecoder* dec,
                                              const JxlCmsInterface cms) {
@@ -2490,6 +2738,21 @@ JXL_EXPORT JxlDecoderStatus JxlDecoderSetCms(JxlDecoder* dec,
   dec->passes_state->output_encoding_info.color_management_system = cms;
   dec->passes_state->output_encoding_info.cms_set = true;
   return JXL_DEC_SUCCESS;
+}
+
+// The image output is a buffer or a callback, never both: a callback set for
+// an earlier frame must not be called instead of the buffer.
+static void SetImageOutBufferFields(JxlDecoder* dec,
+                                    const JxlPixelFormat* format, void* buffer,
+                                    size_t size) {
+  dec->image_out_buffer_set = true;
+  dec->image_out_buffer = buffer;
+  dec->image_out_size = size;
+  dec->image_out_format = *format;
+  dec->image_out_init_callback = nullptr;
+  dec->image_out_run_callback = nullptr;
+  dec->image_out_destroy_callback = nullptr;
+  dec->image_out_init_opaque = nullptr;
 }
 
 static JxlDecoderStatus GetMinSize(const JxlDecoder* dec,
@@ -2505,7 +2768,7 @@ static JxlDecoderStatus GetMinSize(const JxlDecoder* dec,
     xsize = dec->metadata.oriented_preview_xsize(dec->keep_orientation);
     ysize = dec->metadata.oriented_preview_ysize(dec->keep_orientation);
   } else {
-    GetCurrentDimensions(dec, xsize, ysize);
+    GetCurrentDimensions(dec, dec->image_out_downsampling, xsize, ysize);
   }
   if (num_channels == 0) num_channels = format->num_channels;
   size_t row_bits;
@@ -2559,11 +2822,7 @@ JXL_EXPORT JxlDecoderStatus JxlDecoderSetPreviewOutBuffer(
 
   if (size < min_size) return JXL_DEC_ERROR;
 
-  dec->image_out_buffer_set = true;
-  dec->image_out_buffer = buffer;
-  dec->image_out_size = size;
-  dec->image_out_format = *format;
-
+  SetImageOutBufferFields(dec, format, buffer, size);
   return JXL_DEC_SUCCESS;
 }
 
@@ -2601,11 +2860,7 @@ JxlDecoderStatus JxlDecoderSetImageOutBuffer(JxlDecoder* dec,
 
   if (size < min_size) return JXL_DEC_ERROR;
 
-  dec->image_out_buffer_set = true;
-  dec->image_out_buffer = buffer;
-  dec->image_out_size = size;
-  dec->image_out_format = *format;
-
+  SetImageOutBufferFields(dec, format, buffer, size);
   return JXL_DEC_SUCCESS;
 }
 
@@ -2701,6 +2956,9 @@ JxlDecoderStatus JxlDecoderSetMultithreadedImageOutCallback(
   dec->image_out_run_callback = run_callback;
   dec->image_out_destroy_callback = destroy_callback;
   dec->image_out_init_opaque = init_opaque;
+  // A buffer set for an earlier frame or the preview must not be written.
+  dec->image_out_buffer = nullptr;
+  dec->image_out_size = 0;
   dec->image_out_format = *format;
 
   return JXL_DEC_SUCCESS;
@@ -2723,7 +2981,9 @@ JxlDecoderStatus JxlDecoderGetFrameHeader(const JxlDecoder* dec,
   header->is_last = TO_JXL_BOOL(dec->frame_header->is_last);
   size_t xsize;
   size_t ysize;
-  GetCurrentDimensions(dec, xsize, ysize);
+  // The header describes the frame at full resolution, like the basic info;
+  // the output downsampling changes only the output sizes.
+  GetCurrentDimensions(dec, /*downsampling=*/1, xsize, ysize);
   header->layer_info.xsize = xsize;
   header->layer_info.ysize = ysize;
   if (!dec->coalescing && dec->frame_header->custom_size_or_origin) {

@@ -11,3 +11,5 @@ add_executable(decode_progressive ${CMAKE_CURRENT_LIST_DIR}/decode_progressive.c
 target_link_libraries(decode_progressive jxl_dec jxl_threads)
 add_executable(encode_oneshot ${CMAKE_CURRENT_LIST_DIR}/encode_oneshot.cc)
 target_link_libraries(encode_oneshot jxl jxl_threads)
+add_executable(decode_preview ${CMAKE_CURRENT_LIST_DIR}/decode_preview.cc)
+target_link_libraries(decode_preview jxl_dec jxl_threads)

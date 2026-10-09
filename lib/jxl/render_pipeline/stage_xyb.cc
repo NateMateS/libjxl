@@ -147,15 +147,16 @@ class FastXYBStage : public RenderPipelineStage {
   Status ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
                     size_t xextra_left, size_t xextra_right, size_t xsize,
                     size_t xpos, size_t ypos, size_t thread_id) const final {
-    if (ypos >= height_) return true;
+    if (ypos >= height_ || xpos >= width_) return true;
     JXL_ENSURE(xextra_left == 0 && xextra_right == 0);
     const float* xyba[4] = {
         GetInputRow(input_rows, 0, 0), GetInputRow(input_rows, 1, 0),
         GetInputRow(input_rows, 2, 0),
         has_alpha_ ? GetInputRow(input_rows, alpha_c_, 0) : nullptr};
     uint8_t* out_buf = rgb_ + stride_ * ypos + (rgba_ ? 4 : 3) * xpos;
-    size_t x_span = std::min<size_t>(xsize, width_ - xpos);
-    return FastXYBTosRGB8(xyba, out_buf, rgba_, x_span);
+    const size_t clamped_xsize = std::min(xsize, width_ - xpos);
+    if (clamped_xsize == 0) return true;
+    return FastXYBTosRGB8(xyba, out_buf, rgba_, clamped_xsize);
   }
 
   RenderPipelineChannelMode GetChannelMode(size_t c) const final {

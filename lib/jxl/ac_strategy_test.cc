@@ -8,9 +8,11 @@
 #include <jxl/memory_manager.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <hwy/base.h>  // HWY_ALIGN_MAX
 #include <hwy/tests/hwy_gtest.h>
+#include <vector>
 
 #include "lib/jxl/base/random.h"
 #include "lib/jxl/coeff_order_fwd.h"
@@ -220,6 +222,92 @@ HWY_TARGET_INSTANTIATE_TEST_SUITE_P_T(
     ::testing::Range(0, static_cast<int>(AcStrategy::kNumValidStrategies)));
 
 TEST_P(AcStrategyDownsample, Test) { Run(); }
+
+// Test that the reduced-resolution IDCT of a block whose content only has
+// frequencies representable at the reduced size is the box average of the
+// block. The coefficients come from the forward transform, so the test does
+// not assume a coefficient layout.
+class AcStrategyReducedPixels : public ::hwy::TestWithParamTargetAndT<int> {
+ protected:
+  void Run() {
+    JxlMemoryManager* memory_manager = test::MemoryManager();
+    const AcStrategyType type = static_cast<AcStrategyType>(GetParam());
+    const AcStrategy acs = AcStrategy::FromRawStrategy(type);
+    const size_t dct_scratch_size =
+        3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
+    const size_t xsize = acs.covered_blocks_x() * kBlockDim;
+    const size_t ysize = acs.covered_blocks_y() * kBlockDim;
+
+    size_t mem_bytes =
+        (5 * AcStrategy::kMaxCoeffArea + dct_scratch_size) * sizeof(float);
+    JXL_TEST_ASSIGN_OR_DIE(AlignedMemory mem,
+                           AlignedMemory::Create(memory_manager, mem_bytes));
+    float* pixels = mem.address<float>();
+    float* coeffs = pixels + AcStrategy::kMaxCoeffArea;
+    float* reduced = coeffs + AcStrategy::kMaxCoeffArea;
+    float* scratch_space = reduced + AcStrategy::kMaxCoeffArea;
+
+    const auto basis = [](size_t n, size_t k, size_t i) {
+      constexpr double kPi = 3.14159265358979323846;
+      return std::cos(kPi * static_cast<double>((2 * i + 1) * k) /
+                      static_cast<double>(2 * n));
+    };
+    Rng rng(static_cast<uint64_t>(type) * 65537 + 17);
+    for (size_t factor : {2, 4, 8}) {
+      const size_t rx = xsize / factor;
+      const size_t ry = ysize / factor;
+      // pixels = sum over ky < ry, kx < rx of amp * cos(ky, y) * cos(kx, x),
+      // computed separably.
+      std::vector<double> amp(ry * rx);
+      for (double& a : amp) {
+        a = rng.UniformF(-1.0f, 1.0f) / std::sqrt(static_cast<double>(rx * ry));
+      }
+      std::vector<double> rows(ry * xsize, 0.0);
+      for (size_t ky = 0; ky < ry; ky++) {
+        for (size_t kx = 0; kx < rx; kx++) {
+          for (size_t x = 0; x < xsize; x++) {
+            rows[ky * xsize + x] += amp[ky * rx + kx] * basis(xsize, kx, x);
+          }
+        }
+      }
+      for (size_t y = 0; y < ysize; y++) {
+        for (size_t x = 0; x < xsize; x++) {
+          double v = 0;
+          for (size_t ky = 0; ky < ry; ky++) {
+            v += basis(ysize, ky, y) * rows[ky * xsize + x];
+          }
+          pixels[y * xsize + x] = static_cast<float>(v);
+        }
+      }
+      TransformFromPixels(type, pixels, xsize, coeffs, scratch_space);
+      if (!TransformToReducedPixels(type, coeffs, factor, reduced, rx,
+                                    scratch_space)) {
+        ASSERT_FALSE(acs.IsMultiblock() || type == AcStrategyType::DCT)
+            << "acs " << static_cast<int>(type) << " factor " << factor;
+        continue;
+      }
+      for (size_t y = 0; y < ry; y++) {
+        for (size_t x = 0; x < rx; x++) {
+          double sum = 0;
+          for (size_t iy = 0; iy < factor; iy++) {
+            for (size_t ix = 0; ix < factor; ix++) {
+              sum += pixels[(y * factor + iy) * xsize + x * factor + ix];
+            }
+          }
+          ASSERT_NEAR(reduced[y * rx + x], sum / (factor * factor), 1e-4)
+              << "acs " << static_cast<int>(type) << " factor " << factor
+              << " x " << x << " y " << y;
+        }
+      }
+    }
+  }
+};
+
+HWY_TARGET_INSTANTIATE_TEST_SUITE_P_T(
+    AcStrategyReducedPixels,
+    ::testing::Range(0, static_cast<int>(AcStrategy::kNumValidStrategies)));
+
+TEST_P(AcStrategyReducedPixels, Test) { Run(); }
 
 class AcStrategyTargetTest : public ::hwy::TestWithParamTarget {};
 HWY_TARGET_INSTANTIATE_TEST_SUITE_P(AcStrategyTargetTest);

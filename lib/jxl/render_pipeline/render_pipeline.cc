@@ -140,4 +140,19 @@ Status RenderPipelineInput::Done() {
   return true;
 }
 
+bool FrameIsAlignedInImage(const FrameOrigin& origin, size_t frame_xsize,
+                           size_t frame_ysize, size_t image_xsize,
+                           size_t image_ysize, size_t alignment) {
+  const auto aligned = [alignment](int64_t pos, size_t frame_size,
+                                   size_t image_size) {
+    const int64_t a = static_cast<int64_t>(alignment);
+    const int64_t end = pos + static_cast<int64_t>(frame_size);
+    return ((pos % a) + a) % a == 0 &&
+           (((end % a) + a) % a == 0 ||
+            end >= static_cast<int64_t>(image_size));
+  };
+  return aligned(origin.x0, frame_xsize, image_xsize) &&
+         aligned(origin.y0, frame_ysize, image_ysize);
+}
+
 }  // namespace jxl

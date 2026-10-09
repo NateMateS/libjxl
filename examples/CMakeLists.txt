@@ -26,3 +26,6 @@ target_link_libraries(decode_progressive PkgConfig::Jxl)
 
 add_executable(encode_oneshot encode_oneshot.cc)
 target_link_libraries(encode_oneshot PkgConfig::Jxl)
+
+add_executable(decode_preview decode_preview.cc)
+target_link_libraries(decode_preview PkgConfig::Jxl)

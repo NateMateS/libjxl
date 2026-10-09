@@ -23,8 +23,7 @@ SplitImageRenderer::SplitImageRenderer(QWidget* const parent)
     : QWidget(parent) {
   setAttribute(Qt::WA_OpaquePaintEvent);
   setMouseTracking(true);
-  setFocusPolicy(Qt::WheelFocus);
-  grabKeyboard();
+  setFocusPolicy(Qt::StrongFocus);
 
   connect(&fadingPoint_, &QVariantAnimation::valueChanged,
           [this] { update(); });
@@ -78,10 +77,6 @@ void SplitImageRenderer::keyPressEvent(QKeyEvent* const event) {
     case Qt::Key_Up:
     case Qt::Key_Down:
       setRenderingMode(RenderingMode::MIDDLE);
-      break;
-
-    case Qt::Key_Escape:
-      QCoreApplication::quit();
       break;
 
     case Qt::Key_ZoomIn:

@@ -97,6 +97,12 @@ class RenderPipelineStage {
     size_t shift_x = 0;
     size_t shift_y = 0;
 
+    // Power of two such that every rect of rows passed to ProcessRow starts at
+    // a multiple of it in both directions, and ends at a multiple of it or at
+    // the edge of the image: an aligned square of this size is never split
+    // between rects. Only for stages at the final resolution.
+    size_t rect_alignment = 1;
+
     static Settings ShiftX(size_t shift, size_t border) {
       Settings settings;
       settings.border_x = border;

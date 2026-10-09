@@ -206,6 +206,42 @@ std::string ModularStreamId::DebugString() const {
 }
 #endif
 
+namespace {
+
+// Returns whether each channel of `image`, made of `num_channels` channels
+// by the MetaApply of its transforms, is a squeeze residual, by replaying the
+// changes MetaApply makes to the channel list. If the replay does not match
+// `image`, no channel is a residual.
+std::vector<bool> FindSqueezeResiduals(const Image& image,
+                                       size_t num_channels) {
+  std::vector<bool> residuals(num_channels, false);
+  const std::vector<bool> none(image.channel.size(), false);
+  for (const Transform& t : image.transform) {
+    if (t.id == TransformId::kPalette) {
+      // MetaPalette: the channels become one index channel, and the palette
+      // is a new meta channel at the front.
+      const size_t end = static_cast<size_t>(t.begin_c) + t.num_c;
+      if (t.num_c == 0 || end > residuals.size()) return none;
+      residuals.erase(residuals.begin() + t.begin_c + 1,
+                      residuals.begin() + end);
+      residuals[t.begin_c] = false;
+      residuals.insert(residuals.begin(), false);
+    } else if (t.id == TransformId::kSqueeze) {
+      // MetaSqueeze (which filled in default parameters): each channel keeps
+      // its average and gets a residual, after the channels or at the end.
+      for (const SqueezeParams& p : t.squeezes) {
+        const size_t end = static_cast<size_t>(p.begin_c) + p.num_c;
+        if (p.num_c == 0 || end > residuals.size()) return none;
+        const size_t offset = p.in_place ? end : residuals.size();
+        residuals.insert(residuals.begin() + offset, p.num_c, true);
+      }
+    }
+  }
+  return residuals.size() == image.channel.size() ? residuals : none;
+}
+
+}  // namespace
+
 Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
                                              const FrameHeader& frame_header,
                                              bool allow_truncated_group) {
@@ -295,6 +331,7 @@ Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
     return JXL_FAILURE("Failed to decode global modular info");
   }
 
+  squeeze_residuals = FindSqueezeResiduals(gi, nb_chans + nb_extra);
   // TODO(eustas): are we sure this can be done after partial decode?
   have_something = false;
   for (size_t c = 0; c < gi.channel.size(); c++) {
@@ -315,6 +352,27 @@ Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
   JXL_DEBUG_V(6, "DecodeGlobalInfo: full_image (with transforms) %s",
               full_image.DebugString().c_str());
   return dec_status;
+}
+
+bool ModularFrameDecoder::IsProgressionStep(int min_shift) const {
+  if (squeeze_residuals.size() != full_image.channel.size()) return false;
+  // Channels up to the first one larger than a group are decoded with the
+  // global info, the others by shift (see DecodeGroup).
+  size_t c = full_image.nb_meta_channels;
+  for (; c < full_image.channel.size(); c++) {
+    const Channel& ch = full_image.channel[c];
+    if (ch.w > frame_dim.group_dim || ch.h > frame_dim.group_dim) break;
+  }
+  bool missing = false;
+  for (; c < full_image.channel.size(); c++) {
+    const Channel& ch = full_image.channel[c];
+    if (std::min(ch.hshift, ch.vshift) >= min_shift) continue;
+    // Without its residual, a squeezed channel is the smooth upsampling of
+    // its average: less detail, not missing data.
+    if (!squeeze_residuals[c]) return false;
+    missing = true;
+  }
+  return missing;
 }
 
 void ModularFrameDecoder::MaybeDropFullImage() {
@@ -400,9 +458,18 @@ Status ModularFrameDecoder::DecodeGroup(
     for (const auto& t : global_transform) {
       JXL_RETURN_IF_ERROR(t.Inverse(gi, global_header.wp_header));
     }
-    JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
-        frame_header, gi, dec_state, nullptr, *render_pipeline_input,
-        Rect(0, 0, gi.w, gi.h)));
+    // A reduced pipeline input covers colour and extra channels of modular
+    // frames, and the extra channels of VarDCT frames (whose colour is
+    // reduced by TransformToReducedPixels).
+    if (dec_state->pipeline_input_downsampling > 1) {
+      JXL_RETURN_IF_ERROR(ModularImageToDownsampledRect(
+          frame_header, gi, dec_state, *render_pipeline_input,
+          Rect(0, 0, gi.w, gi.h)));
+    } else {
+      JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
+          frame_header, gi, dec_state, nullptr, *render_pipeline_input,
+          Rect(0, 0, gi.w, gi.h)));
+    }
     return true;
   }
   int gic = 0;
@@ -561,9 +628,10 @@ Status ModularFrameDecoder::DecodeAcMetadata(const FrameHeader& frame_header,
   return true;
 }
 
+template <typename Input>
 Status ModularFrameDecoder::ModularImageToDecodedRect(
     const FrameHeader& frame_header, Image& gi, PassesDecoderState* dec_state,
-    jxl::ThreadPool* pool, RenderPipelineInput& render_pipeline_input,
+    jxl::ThreadPool* pool, Input& render_pipeline_input,
     Rect modular_rect) const {
   const auto* metadata = frame_header.nonserialized_metadata;
   JXL_ENSURE(gi.transform.empty());
@@ -737,6 +805,91 @@ Status ModularFrameDecoder::ModularImageToDecodedRect(
   return true;
 }
 
+namespace {
+
+// Full resolution buffers standing in for the render pipeline input.
+struct FullResolutionBand {
+  std::vector<std::pair<ImageF*, Rect>> buffers;
+  const std::pair<ImageF*, Rect>& GetBuffer(size_t c) const {
+    JXL_DASSERT(c < buffers.size());
+    return buffers[c];
+  }
+};
+
+// Writes the averages of the `F` x `F` boxes of the top-left `xsize` x
+// `ysize` samples of `in` to `out`, starting at row `out_y0` of its rect.
+// Boxes at the right and bottom are cropped to the samples.
+void BoxAverage(const ImageF& in, size_t xsize, size_t ysize, size_t F,
+                const std::pair<ImageF*, Rect>& out, size_t out_y0) {
+  for (size_t sy0 = 0, oy = out_y0; sy0 < ysize; sy0 += F, ++oy) {
+    const size_t sy1 = std::min(sy0 + F, ysize);
+    float* JXL_RESTRICT row_out = out.second.Row(out.first, oy);
+    for (size_t sx0 = 0, ox = 0; sx0 < xsize; sx0 += F, ++ox) {
+      const size_t sx1 = std::min(sx0 + F, xsize);
+      // Double, so that sums of large finite samples do not overflow.
+      double sum = 0;
+      for (size_t sy = sy0; sy < sy1; ++sy) {
+        const float* JXL_RESTRICT row_in = in.ConstRow(sy);
+        for (size_t sx = sx0; sx < sx1; ++sx) sum += row_in[sx];
+      }
+      row_out[ox] = static_cast<float>(
+          sum / static_cast<double>((sy1 - sy0) * (sx1 - sx0)));
+    }
+  }
+}
+
+}  // namespace
+
+Status ModularFrameDecoder::ModularImageToDownsampledRect(
+    const FrameHeader& frame_header, Image& gi, PassesDecoderState* dec_state,
+    RenderPipelineInput& render_pipeline_input, Rect modular_rect) const {
+  const size_t F = dec_state->pipeline_input_downsampling;
+  JXL_ENSURE(F > 1);
+  // `modular_rect` can extend past the frame (DecodeGroup passes whole
+  // groups); the channels hold the part inside it.
+  Rect rect = modular_rect;
+  for (const Channel& ch : gi.channel) rect = rect.Crop(ch.plane);
+  const size_t xsize = rect.xsize();
+  const size_t ysize = rect.ysize();
+  // The pipeline channels that ModularImageToDecodedRect writes.
+  const size_t begin_c = do_color ? 0 : 3;
+  const size_t end_c =
+      3 + frame_header.nonserialized_metadata->m.num_extra_channels;
+  for (size_t c = begin_c; c < end_c; ++c) {
+    const Rect& r = render_pipeline_input.GetBuffer(c).second;
+    if (r.xsize() != DivCeil(xsize, F) || r.ysize() != DivCeil(ysize, F)) {
+      return JXL_FAILURE("Dimension mismatch: trying to downsample a %" PRIuS
+                         "x%" PRIuS " modular rect into a %" PRIuS "x%" PRIuS
+                         " rect",
+                         xsize, ysize, r.xsize(), r.ysize());
+    }
+  }
+  // Bands of whole boxes bound the full resolution temporaries.
+  const size_t band_ysize = std::min(RoundUpTo(64, F), ysize);
+  std::vector<ImageF> band_images;
+  FullResolutionBand band;
+  band.buffers.resize(end_c);
+  for (size_t c = begin_c; c < end_c; ++c) {
+    JXL_ASSIGN_OR_RETURN(ImageF image,
+                         ImageF::Create(memory_manager_, xsize, band_ysize));
+    band_images.emplace_back(std::move(image));
+  }
+  for (size_t y0 = 0; y0 < ysize; y0 += band_ysize) {
+    const size_t rows = std::min(band_ysize, ysize - y0);
+    for (size_t c = begin_c; c < end_c; ++c) {
+      band.buffers[c] = {&band_images[c - begin_c], Rect(0, 0, xsize, rows)};
+    }
+    JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
+        frame_header, gi, dec_state, /*pool=*/nullptr, band,
+        Rect(rect.x0(), rect.y0() + y0, xsize, rows)));
+    for (size_t c = begin_c; c < end_c; ++c) {
+      BoxAverage(band_images[c - begin_c], xsize, rows, F,
+                 render_pipeline_input.GetBuffer(c), y0 / F);
+    }
+  }
+  return true;
+}
+
 Status ModularFrameDecoder::FinalizeDecoding(const FrameHeader& frame_header,
                                              PassesDecoderState* dec_state,
                                              jxl::ThreadPool* pool,
@@ -778,9 +931,14 @@ Status ModularFrameDecoder::FinalizeDecoding(const FrameHeader& frame_header,
                                  size_t thread_id) -> Status {
     RenderPipelineInput input =
         dec_state->render_pipeline->GetInputBuffers(group, thread_id);
-    JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
-        frame_header, gi, dec_state, nullptr, input,
-        dec_state->shared->frame_dim.GroupRect(group)));
+    const Rect group_rect = dec_state->shared->frame_dim.GroupRect(group);
+    if (dec_state->pipeline_input_downsampling > 1) {
+      JXL_RETURN_IF_ERROR(ModularImageToDownsampledRect(
+          frame_header, gi, dec_state, input, group_rect));
+    } else {
+      JXL_RETURN_IF_ERROR(ModularImageToDecodedRect(
+          frame_header, gi, dec_state, nullptr, input, group_rect));
+    }
     JXL_RETURN_IF_ERROR(input.Done());
     return true;
   };

@@ -11,6 +11,8 @@
 #include "tools/comparison_viewer/settings.h"
 #include "tools/comparison_viewer/ui_split_image_view.h"
 
+class QShowEvent;
+
 namespace jpegxl {
 namespace tools {
 
@@ -27,6 +29,9 @@ class SplitImageView : public QWidget {
 
  signals:
   void renderingModeChanged(SplitImageRenderer::RenderingMode newMode);
+
+ protected:
+  void showEvent(QShowEvent* event) override;
 
  private slots:
   void on_settingsButton_clicked();

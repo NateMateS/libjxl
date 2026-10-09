@@ -109,6 +109,22 @@ struct PassesDecoderState {
   // Image dimensions before applying undo_orientation.
   size_t width;
   size_t height;
+  size_t full_output_width = 0;
+  size_t full_output_height = 0;
+  size_t output_downsampling = 1;
+  size_t pipeline_input_downsampling = 1;
+  size_t effective_frame_upsampling = 1;
+  size_t writer_downsampling = 1;
+  JxlImageOutDownsamplingMethod downsampling_method =
+      JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_NONE;
+  // Whether the render pipeline has the three temporary noise input channels.
+  // Previews skip noise, so noise frames may be rendered without them.
+  bool pipeline_has_noise_channels = false;
+  // Set by PreparePipeline when the downsampling writer cannot run in the
+  // frame's pipeline (a blended frame that is not aligned to the factor in
+  // the image): the pipeline then renders into the ImageBundle, and
+  // WriteOutputFromImage writes the output from it once the frame is done.
+  bool output_from_image = false;
   ImageOutput main_output;
   std::vector<ImageOutput> extra_output;
 
@@ -144,6 +160,17 @@ struct PassesDecoderState {
     bool coalescing;
     bool render_spotcolors;
     bool render_noise;
+    // Preview-only mode where the caller will discard the decoder after this
+    // frame and never decode subsequent frames.  When true, the reference
+    // image storage is not populated for `CanBeReferenced()` frames, which in
+    // turn lets the reduced-input / postprocess-skipping preview shortcuts
+    // engage on animation frames that would otherwise be saved as references.
+    bool preview_no_future_frames = false;
+    bool allow_native_reduced_input = true;
+    bool allow_native_fused_upsampling = true;
+    // Allows a 1/8 preview of a VarDCT frame to be rendered from the DC image
+    // alone, without decoding the AC sections.
+    bool allow_native_dc_only = true;
   };
 
   JxlMemoryManager* memory_manager() const { return shared->memory_manager; }
@@ -151,6 +178,10 @@ struct PassesDecoderState {
   Status PreparePipeline(const FrameHeader& frame_header,
                          const ImageMetadata* metadata, ImageBundle* decoded,
                          PipelineOptions options);
+
+  // Writes `image`, the whole rendered image, to the outputs with the
+  // downsampling writer (see output_from_image).
+  Status WriteOutputFromImage(const ImageBundle& image, ThreadPool* pool);
 
   // Information for colour conversions.
   OutputEncodingInfo output_encoding_info;
@@ -161,6 +192,16 @@ struct PassesDecoderState {
     x_dm_multiplier = std::pow(1 / (1.25f), frame_header.x_qm_scale - 2.0f);
     b_dm_multiplier = std::pow(1 / (1.25f), frame_header.b_qm_scale - 2.0f);
 
+    // Set again by FrameDecoder::SetImageOutput for a frame with outputs.
+    full_output_width = 0;
+    full_output_height = 0;
+    output_downsampling = 1;
+    pipeline_input_downsampling = 1;
+    effective_frame_upsampling = frame_header.upsampling;
+    writer_downsampling = 1;
+    downsampling_method = JXL_IMAGE_OUT_DOWNSAMPLING_METHOD_NONE;
+    pipeline_has_noise_channels = false;
+    output_from_image = false;
     main_output.callback = PixelCallback();
     main_output.buffer = nullptr;
     extra_output.clear();
@@ -204,6 +245,18 @@ struct HWY_ALIGN_MAX GroupDecCache {
     return true;
   }
 
+  // The 8 rows that one DC row upsamples to, for drawing the DC at reduced
+  // pipeline resolution (see DecodeGroup).
+  Status InitDCUpsampledOnce(JxlMemoryManager* memory_manager) {
+    if (dc_upsampled.xsize() == 0) {
+      JXL_ASSIGN_OR_RETURN(
+          dc_upsampled,
+          ImageF::Create(memory_manager, kGroupDim + kRenderPipelineXOffset * 2,
+                         kBlockDim));
+    }
+    return true;
+  }
+
   // Scratch space used by DecGroupImpl().
   float* dec_group_block;
   int32_t* dec_group_qblock;
@@ -220,6 +273,13 @@ struct HWY_ALIGN_MAX GroupDecCache {
 
   // Buffer for DC upsampling.
   ImageF dc_buffer;
+  ImageF dc_upsampled;
+
+  // Total scratch capacity (in floats) currently allocated for
+  // dec_group_block + scratch_space. Equals 4 * max_block_area_, which is
+  // the conservative budget reserved by InitOnce(). Used by DecodeGroupImpl
+  // to assert that reduced-preview / fallback paths fit within scratch.
+  size_t scratch_space_floats() const { return 4 * max_block_area_; }
 
  private:
   AlignedMemory float_memory_;

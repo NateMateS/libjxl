@@ -5,9 +5,9 @@
 
 #include "tools/comparison_viewer/split_image_view.h"
 
-#include <utility>
-
 #include <QLabel>
+#include <QShowEvent>
+#include <utility>
 
 #include "tools/comparison_viewer/split_image_renderer.h"
 
@@ -50,6 +50,13 @@ SplitImageView::SplitImageView(QWidget* const parent) : QWidget(parent) {
   connect(ui_.splitImageRenderer, &SplitImageRenderer::renderingModeChanged,
           this, &SplitImageView::renderingModeChanged);
 
+  // Return focus to the renderer after slider interactions so that arrow-key
+  // rendering-mode shortcuts work again without requiring an explicit click.
+  connect(ui_.zoomLevelSlider, &QSlider::sliderReleased, this,
+          [this] { ui_.splitImageRenderer->setFocus(); });
+  connect(ui_.middleWidthSlider, &QSlider::sliderReleased, this,
+          [this] { ui_.splitImageRenderer->setFocus(); });
+
   const SplitImageRenderingSettings renderingSettings =
       settings_.renderingSettings();
   if (renderingSettings.restoreLastZoomLevel) {
@@ -73,6 +80,11 @@ void SplitImageView::setRightImage(QImage image) {
 
 void SplitImageView::setMiddleImage(QImage image) {
   ui_.splitImageRenderer->setMiddleImage(std::move(image));
+}
+
+void SplitImageView::showEvent(QShowEvent* const event) {
+  QWidget::showEvent(event);
+  ui_.splitImageRenderer->setFocus();
 }
 
 void SplitImageView::on_settingsButton_clicked() {

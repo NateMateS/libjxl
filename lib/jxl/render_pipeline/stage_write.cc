@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -55,6 +56,7 @@ using hwy::HWY_NAMESPACE::RebindToUnsigned;
 using hwy::HWY_NAMESPACE::ShiftLeftSame;
 using hwy::HWY_NAMESPACE::ShiftRightSame;
 using hwy::HWY_NAMESPACE::VFromD;
+using hwy::HWY_NAMESPACE::Zero;
 
 // 32x32 blue noise dithering pattern from
 // https://momentsingraphics.de/BlueNoise.html#Downloads scaled to have
@@ -288,22 +290,26 @@ VFromD<Rebind<T, DF>> MakeUnsigned(VFromD<DF> v, size_t x0, size_t y0,
 class WriteToOutputStage : public RenderPipelineStage {
  public:
   WriteToOutputStage(const ImageOutput& main_output, size_t width,
-                     size_t height, bool has_alpha, bool unpremul_alpha,
+                     size_t height, size_t full_width, size_t full_height,
+                     size_t downsampling, bool has_alpha, bool unpremul_alpha,
                      size_t alpha_c, Orientation undo_orientation,
                      const std::vector<ImageOutput>& extra_output,
                      JxlMemoryManager* memory_manager)
-      : RenderPipelineStage(RenderPipelineStage::Settings()),
+      : RenderPipelineStage(DownsamplingSettings(downsampling)),
         width_(width),
         height_(height),
+        full_width_(full_width),
+        full_height_(full_height),
+        downsampling_(downsampling),
         main_(main_output),
         num_color_(main_.num_channels_ < 3 ? 1 : 3),
         want_alpha_(main_.num_channels_ == 2 || main_.num_channels_ == 4),
         has_alpha_(has_alpha),
         unpremul_alpha_(unpremul_alpha),
         alpha_c_(alpha_c),
-        flip_x_(ShouldFlipX(undo_orientation)),
-        flip_y_(ShouldFlipY(undo_orientation)),
-        transpose_(ShouldTranspose(undo_orientation)),
+        flip_x_(OrientationShouldFlipX(undo_orientation)),
+        flip_y_(OrientationShouldFlipY(undo_orientation)),
+        transpose_(OrientationShouldTranspose(undo_orientation)),
         opaque_alpha_(kChunkSize, 1.0f),
         memory_manager_(memory_manager) {
     for (size_t ec = 0; ec < extra_output.size(); ++ec) {
@@ -336,6 +342,9 @@ class WriteToOutputStage : public RenderPipelineStage {
                     size_t xpos, size_t ypos, size_t thread_id) const final {
     JXL_ENSURE(xextra_left == 0 && xextra_right == 0);
     JXL_ENSURE(main_.run_opaque_ || main_.buffer_);
+    if (downsampling_ > 1) {
+      return ProcessDownsampledRow(input_rows, xsize, xpos, ypos, thread_id);
+    }
     if (ypos >= height_) return true;
     if (xpos >= width_) return true;
     if (flip_y_) {
@@ -417,6 +426,29 @@ class WriteToOutputStage : public RenderPipelineStage {
     size_t channel_index_;  // used for extra_channels
   };
 
+  static Settings DownsamplingSettings(size_t downsampling) {
+    // Every box of downsampling x downsampling pixels is then rendered whole
+    // by one thread, in one rect.
+    Settings settings;
+    settings.rect_alignment = downsampling;
+    return settings;
+  }
+
+  static constexpr size_t kIdle = std::numeric_limits<size_t>::max();
+
+  // Sums of the box row being accumulated by one thread for one output.
+  struct DownsampleAccumulator {
+    // Output row of the box row, or kIdle.
+    size_t out_y = kIdle;
+    // First input column (a multiple of the factor) and number of input
+    // columns of the rect the box row belongs to.
+    size_t xpos = 0;
+    size_t limit = 0;
+    size_t row_count = 0;
+    // Per output pixel, interleaved channel sums.
+    std::vector<float> sums;
+  };
+
   Status PrepareForThreads(size_t num_threads) override {
     JXL_RETURN_IF_ERROR(main_.PrepareForThreads(num_threads));
     for (auto& extra : extra_channels_) {
@@ -436,27 +468,19 @@ class WriteToOutputStage : public RenderPipelineStage {
             temp, AlignedMemory::Create(memory_manager_, alloc_size));
       }
     }
+    if (downsampling_ > 1) {
+      flush_rows_.resize(num_threads * main_.num_channels_);
+      for (AlignedMemory& row : flush_rows_) {
+        JXL_ASSIGN_OR_RETURN(
+            row, AlignedMemory::Create(memory_manager_, alloc_size));
+      }
+      // A render that failed part way may have left box rows open.
+      main_downsample_.assign(num_threads, DownsampleAccumulator());
+      extra_downsample_.assign(num_threads, std::vector<DownsampleAccumulator>(
+                                                extra_channels_.size()));
+    }
     return true;
   }
-  static bool ShouldFlipX(Orientation undo_orientation) {
-    return (undo_orientation == Orientation::kFlipHorizontal ||
-            undo_orientation == Orientation::kRotate180 ||
-            undo_orientation == Orientation::kRotate270 ||
-            undo_orientation == Orientation::kAntiTranspose);
-  }
-  static bool ShouldFlipY(Orientation undo_orientation) {
-    return (undo_orientation == Orientation::kFlipVertical ||
-            undo_orientation == Orientation::kRotate180 ||
-            undo_orientation == Orientation::kRotate90 ||
-            undo_orientation == Orientation::kAntiTranspose);
-  }
-  static bool ShouldTranspose(Orientation undo_orientation) {
-    return (undo_orientation == Orientation::kTranspose ||
-            undo_orientation == Orientation::kRotate90 ||
-            undo_orientation == Orientation::kRotate270 ||
-            undo_orientation == Orientation::kAntiTranspose);
-  }
-
   void UnpremulAlpha(size_t thread_id, size_t len,
                      const float** line_buffers) const {
     const HWY_FULL(float) d;
@@ -479,6 +503,112 @@ class WriteToOutputStage : public RenderPipelineStage {
     for (size_t c = 0; c < main_.num_channels_; ++c) {
       line_buffers[c] = temp_in[c];
     }
+  }
+
+  // Box-downsamples by `downsampling_`. The pipeline gives this stage rects
+  // aligned to the factor (Settings::rect_alignment), so each box is
+  // accumulated whole, row by row, by the thread rendering its rect; a
+  // violation is an error rather than a seam.
+  Status ProcessDownsampledRow(const RowInfo& input_rows, size_t xsize,
+                               size_t xpos, size_t ypos,
+                               size_t thread_id) const {
+    if (ypos >= full_height_ || xpos >= full_width_) return true;
+    JXL_ENSURE(xpos % downsampling_ == 0);
+    const size_t limit = std::min(xsize, full_width_ - xpos);
+    const float* rows[4] = {};
+    for (size_t c = 0; c < num_color_; ++c) {
+      rows[c] = GetInputRow(input_rows, c, 0);
+    }
+    // A null row reads as opaque alpha.
+    rows[num_color_] =
+        has_alpha_ ? GetInputRow(input_rows, alpha_c_, 0) : nullptr;
+    JXL_RETURN_IF_ERROR(
+        AccumulateRow(main_, &main_downsample_[thread_id], rows,
+                      has_alpha_ && want_alpha_ && unpremul_alpha_, xpos, ypos,
+                      limit, thread_id));
+    for (size_t ec = 0; ec < extra_channels_.size(); ++ec) {
+      const Output& extra = extra_channels_[ec];
+      const float* extra_rows[4] = {
+          GetInputRow(input_rows, extra.channel_index_, 0)};
+      JXL_RETURN_IF_ERROR(
+          AccumulateRow(extra, &extra_downsample_[thread_id][ec], extra_rows,
+                        /*unpremul=*/false, xpos, ypos, limit, thread_id));
+    }
+    return true;
+  }
+
+  // Adds input row `ypos` (columns [xpos, xpos + limit) of `rows`) to the box
+  // row of `out`, and outputs the box row after its last input row.
+  Status AccumulateRow(const Output& out, DownsampleAccumulator* acc,
+                       const float* const* rows, bool unpremul, size_t xpos,
+                       size_t ypos, size_t limit, size_t thread_id) const {
+    const size_t f = downsampling_;
+    const size_t nc = out.num_channels_;
+    const size_t out_y = ypos / f;
+    if (ypos % f == 0) {
+      JXL_ENSURE(acc->out_y == kIdle);
+      acc->out_y = out_y;
+      acc->xpos = xpos;
+      acc->limit = limit;
+      acc->row_count = 0;
+      acc->sums.assign(DivCeil(limit, f) * nc, 0.0f);
+    } else {
+      JXL_ENSURE(acc->out_y == out_y && acc->xpos == xpos &&
+                 acc->limit == limit);
+    }
+    // kChunkSize is a multiple of the factor: boxes do not straddle chunks.
+    for (size_t x0 = 0; x0 < limit; x0 += kChunkSize) {
+      const size_t len = std::min(kChunkSize, limit - x0);
+      const float* chunk[4] = {};
+      for (size_t c = 0; c < nc; ++c) {
+        chunk[c] = rows[c] ? rows[c] + x0 : opaque_alpha_.data();
+      }
+      if (unpremul) UnpremulAlpha(thread_id, len, chunk);
+      for (size_t begin = 0; begin < len; begin += f) {
+        const size_t end = std::min(len, begin + f);
+        float* sums = &acc->sums[((x0 + begin) / f) * nc];
+        for (size_t c = 0; c < nc; ++c) {
+          float sum = 0.0f;
+          for (size_t x = begin; x < end; ++x) sum += chunk[c][x];
+          sums[c] += sum;
+        }
+      }
+    }
+    ++acc->row_count;
+    if ((ypos + 1) % f == 0 || ypos + 1 == full_height_) {
+      JXL_ENSURE(acc->row_count == std::min(f, full_height_ - out_y * f));
+      FlushAccumulator(out, acc, thread_id);
+    }
+    return true;
+  }
+
+  // Outputs the averages of a complete box row, in chunks of at most
+  // kChunkSize pixels.
+  void FlushAccumulator(const Output& out, DownsampleAccumulator* acc,
+                        size_t thread_id) const {
+    const size_t f = downsampling_;
+    const size_t nc = out.num_channels_;
+    const size_t out_xstart = acc->xpos / f;
+    const size_t out_xsize = DivCeil(acc->limit, f);
+    size_t out_y = acc->out_y;
+    if (flip_y_) out_y = height_ - 1u - out_y;
+    for (size_t x0 = 0; x0 < out_xsize; x0 += kChunkSize) {
+      const size_t len = std::min(kChunkSize, out_xsize - x0);
+      const float* rows[4] = {};
+      for (size_t c = 0; c < nc; ++c) {
+        float* row =
+            flush_rows_[thread_id * main_.num_channels_ + c].address<float>();
+        for (size_t x = 0; x < len; ++x) {
+          const size_t box = x0 + x;
+          const size_t cols = std::min(f, acc->limit - box * f);
+          row[x] = acc->sums[box * nc + c] /
+                   static_cast<float>(cols * acc->row_count);
+        }
+        rows[c] = row;
+      }
+      OutputBuffers(out, thread_id, out_y, out_xstart + x0, len, rows);
+    }
+    acc->out_y = kIdle;
   }
 
   void OutputBuffers(const Output& out, size_t thread_id, size_t ypos,
@@ -695,6 +825,9 @@ class WriteToOutputStage : public RenderPipelineStage {
   // Process row in chunks to keep per-thread buffers compact.
   size_t width_;
   size_t height_;
+  size_t full_width_;
+  size_t full_height_;
+  size_t downsampling_;
   Output main_;  // color + alpha
   size_t num_color_;
   bool want_alpha_;
@@ -709,15 +842,22 @@ class WriteToOutputStage : public RenderPipelineStage {
   JxlMemoryManager* memory_manager_;
   std::vector<AlignedMemory> temp_in_;
   std::vector<AlignedMemory> temp_out_;
+  // Averaged output rows of the downsampling flush, per thread and
+  // channel.
+  std::vector<AlignedMemory> flush_rows_;
+  mutable std::vector<DownsampleAccumulator> main_downsample_;
+  mutable std::vector<std::vector<DownsampleAccumulator>> extra_downsample_;
 };
 
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
-    const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
+    const ImageOutput& main_output, size_t width, size_t height,
+    size_t full_width, size_t full_height, size_t downsampling, bool has_alpha,
     bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
     std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager) {
   return jxl::make_unique<WriteToOutputStage>(
-      main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
-      undo_orientation, extra_output, memory_manager);
+      main_output, width, height, full_width, full_height, downsampling,
+      has_alpha, unpremul_alpha, alpha_c, undo_orientation, extra_output,
+      memory_manager);
 }
 
 // NOLINTNEXTLINE(google-readability-namespace-comments)
@@ -849,12 +989,14 @@ std::unique_ptr<RenderPipelineStage> GetWriteToImage3FStage(
 }
 
 std::unique_ptr<RenderPipelineStage> GetWriteToOutputStage(
-    const ImageOutput& main_output, size_t width, size_t height, bool has_alpha,
+    const ImageOutput& main_output, size_t width, size_t height,
+    size_t full_width, size_t full_height, size_t downsampling, bool has_alpha,
     bool unpremul_alpha, size_t alpha_c, Orientation undo_orientation,
     std::vector<ImageOutput>& extra_output, JxlMemoryManager* memory_manager) {
   return HWY_DYNAMIC_DISPATCH(GetWriteToOutputStage)(
-      main_output, width, height, has_alpha, unpremul_alpha, alpha_c,
-      undo_orientation, extra_output, memory_manager);
+      main_output, width, height, full_width, full_height, downsampling,
+      has_alpha, unpremul_alpha, alpha_c, undo_orientation, extra_output,
+      memory_manager);
 }
 
 }  // namespace jxl

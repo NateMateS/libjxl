@@ -152,6 +152,16 @@ class RenderPipeline {
   virtual Status Init() { return true; }
 };
 
+// Whether a frame of `frame_xsize` x `frame_ysize` (upsampled) pixels at
+// `origin` in an image of `image_xsize` x `image_ysize` pixels starts at a
+// multiple of `alignment` and ends at one or beyond the image. In image
+// coordinates, the low-memory pipeline can only give stages aligned rects
+// (Settings::rect_alignment) for such frames, because the frame edges separate
+// the frame's rects from the out-of-frame ones.
+bool FrameIsAlignedInImage(const FrameOrigin& origin, size_t frame_xsize,
+                           size_t frame_ysize, size_t image_xsize,
+                           size_t image_ysize, size_t alignment);
+
 }  // namespace jxl
 
 #endif  // LIB_JXL_RENDER_PIPELINE_RENDER_PIPELINE_H_

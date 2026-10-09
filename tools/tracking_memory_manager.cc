@@ -10,19 +10,21 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 
 #include "lib/jxl/base/status.h"
-#include "lib/jxl/memory_manager_internal.h"
 
 namespace jpegxl {
 namespace tools {
 
 TrackingMemoryManager::TrackingMemoryManager(uint64_t cap, uint64_t total_cap)
     : cap_(cap), total_cap_(total_cap) {
-  jxl::Status status = jxl::MemoryManagerInit(&default_, nullptr);
-  JXL_DASSERT(status);
-  (void)status;
+  default_.opaque = nullptr;
+  default_.alloc = [](void*, size_t size) -> void* {
+    return std::malloc(size);
+  };
+  default_.free = [](void*, void* p) { std::free(p); };
   inner_ = &default_;
 
   outer_.opaque = reinterpret_cast<void*>(this);
@@ -82,21 +84,22 @@ void TrackingMemoryManager::Free(void* opaque, void* address) {
   if (address == nullptr) return;
   TrackingMemoryManager* self =
       reinterpret_cast<TrackingMemoryManager*>(opaque);
-  bool found = false;
   size_t size = 0;
   {
     std::lock_guard<std::mutex> guard(self->map_mutex_);
     auto entry = self->allocations_.find(address);
-    if (entry != self->allocations_.end()) {
-      found = true;
-      size = entry->second;
-      self->allocations_.erase(entry);
-    } else {
-      JXL_DEBUG_ABORT("Internal logic error");
+    // The harness must observe every allocation that the library frees
+    // through it. An untracked free indicates either a library bug or a
+    // mismatched memory_manager being passed somewhere; abort hard so the
+    // stack trace points at the offending free site, in all build modes.
+    if (entry == self->allocations_.end()) {
+      ::jxl::Debug("TrackingMemoryManager: untracked free of %p\n", address);
+      std::abort();
     }
+    size = entry->second;
+    self->allocations_.erase(entry);
   }
-
-  if (found) {
+  {
     std::lock_guard<std::mutex> guard(self->numbers_mutex_);
     self->num_allocations_--;
     self->bytes_in_use_ -= size;

@@ -264,6 +264,29 @@ Status LowMemoryRenderPipeline::Init() {
   constexpr size_t kGroupXAlign = 16;
 #endif
   group_border_.first = RoundUpTo(group_border_.first, kGroupXAlign);
+  // Rects start and end at group boundaries plus or minus the border (or at
+  // the frame edges), so aligned borders give stages aligned rects. Group
+  // dimensions are multiples of 128.
+  size_t rect_alignment = 1;
+  for (size_t i = 0; i < stages_.size(); i++) {
+    const size_t alignment = stages_[i]->settings_.rect_alignment;
+    if (alignment == 1) continue;
+    JXL_ENSURE(alignment != 0 && (alignment & (alignment - 1)) == 0);
+    for (size_t c = 0; c < shifts.size(); c++) {
+      if (stages_[i]->GetChannelMode(c) !=
+          RenderPipelineChannelMode::kIgnored) {
+        JXL_ENSURE(channel_shifts_[i][c].first == 0 &&
+                   channel_shifts_[i][c].second == 0);
+      }
+    }
+    rect_alignment = std::max(rect_alignment, alignment);
+  }
+  JXL_ENSURE(
+      (frame_dimensions_.group_dim << base_color_shift_) % rect_alignment == 0);
+  const size_t input_alignment =
+      std::max<size_t>(1, rect_alignment >> base_color_shift_);
+  group_border_.first = RoundUpTo(group_border_.first, input_alignment);
+  group_border_.second = RoundUpTo(group_border_.second, input_alignment);
   // Allocate borders in group images that are just enough for storing the
   // borders to be copied in, plus any rounding to ensure alignment.
   std::pair<size_t, size_t> max_border = {0, 0};
@@ -310,6 +333,14 @@ Status LowMemoryRenderPipeline::Init() {
                                      &frame_origin_);
       break;
     }
+  }
+  if (first_image_dim_stage_ != stages_.size()) {
+    // The frame edges are rect edges too: callers must not request aligned
+    // rects for a frame that is not aligned in the image.
+    JXL_ENSURE(FrameIsAlignedInImage(
+        frame_origin_, frame_dimensions_.xsize_upsampled,
+        frame_dimensions_.ysize_upsampled, full_image_xsize_, full_image_ysize_,
+        rect_alignment));
   }
   for (size_t i = first_image_dim_stage_; i < stages_.size(); i++) {
     if (stages_[i]->SwitchToImageDimensions()) {

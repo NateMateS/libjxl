@@ -46,6 +46,23 @@ enum class Orientation : uint32_t {
 };
 // Don't need an EnumBits because Orientation is not read via Enum().
 
+// Helpers that decompose an undo-orientation value into three primitive
+// transform flags.  Together they fully describe all eight EXIF orientations
+// and are shared between stage_write.cc and dec_cache.cc so both sites
+// remain in sync without duplicating the mapping.
+inline bool OrientationShouldTranspose(Orientation o) {
+  return (o == Orientation::kTranspose || o == Orientation::kRotate90 ||
+          o == Orientation::kRotate270 || o == Orientation::kAntiTranspose);
+}
+inline bool OrientationShouldFlipX(Orientation o) {
+  return (o == Orientation::kFlipHorizontal || o == Orientation::kRotate180 ||
+          o == Orientation::kRotate270 || o == Orientation::kAntiTranspose);
+}
+inline bool OrientationShouldFlipY(Orientation o) {
+  return (o == Orientation::kFlipVertical || o == Orientation::kRotate180 ||
+          o == Orientation::kRotate90 || o == Orientation::kAntiTranspose);
+}
+
 enum class ExtraChannel : uint32_t {
   // First two enumerators (most common) are cheaper to encode
   kAlpha = JXL_CHANNEL_ALPHA,

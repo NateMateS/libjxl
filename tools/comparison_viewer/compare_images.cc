@@ -12,6 +12,7 @@
 #include <QFlags>
 #include <QImage>
 #include <QMessageBox>
+#include <QShortcut>
 #include <QStringList>
 
 #include "tools/comparison_viewer/image_loading.h"
@@ -154,6 +155,13 @@ int main(int argc, char** argv) {
   view.setWindowState(Qt::WindowMaximized);
   view.setWindowTitle(windowTitle(leftImagePath, rightImagePath));
   view.show();
+
+  // Quit the application when Escape is pressed while this window is active.
+  // This shortcut lives here rather than inside SplitImageRenderer so that it
+  // does not fire inside codec_comparison_window, where the OS close button is
+  // the correct quit affordance.
+  QObject::connect(new QShortcut(Qt::Key_Escape, &view), &QShortcut::activated,
+                   &QCoreApplication::quit);
 
   return application.exec();
 }
