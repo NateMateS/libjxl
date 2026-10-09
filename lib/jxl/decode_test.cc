@@ -19,10 +19,12 @@
 #include <jxl/types.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <ostream>
 #include <set>
@@ -33,6 +35,7 @@
 #include <vector>
 
 #include "lib/extras/dec/color_description.h"
+#include "lib/extras/dec/jxl.h"
 #include "lib/extras/enc/encode.h"
 #include "lib/extras/enc/jpg.h"
 #include "lib/extras/packed_image.h"
@@ -5778,4 +5781,76 @@ TEST(DecodeTest, CloseInput) {
   EXPECT_EQ(JXL_DEC_NEED_MORE_INPUT, JxlDecoderProcessInput(dec.get()));
   JxlDecoderCloseInput(dec.get());
   EXPECT_EQ(JXL_DEC_ERROR, JxlDecoderProcessInput(dec.get()));
+}
+
+// Lossless binary32 samples of both signs and all magnitudes, with zeros of
+// both signs, infinities and subnormals, round-trip bit for bit at every
+// effort. The modular encoder codes them as their bit patterns, whose
+// differences do not fit an int32: it used to compute residuals (and the
+// absolute values of samples while learning trees) with signed overflow,
+// which UBSan reports.
+TEST(DecodeTest, ModularLosslessBinary32MixedSigns) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  constexpr size_t xsize = 67;
+  constexpr size_t ysize = 45;
+  constexpr float kInf = std::numeric_limits<float>::infinity();
+  const float specials[] = {0.0f, -0.0f, kInf, -kInf, 1e-40f, -5e-45f};
+  std::vector<float> samples(xsize * ysize * 3);
+  for (size_t y = 0; y < ysize; ++y) {
+    for (size_t x = 0; x < xsize; ++x) {
+      for (size_t c = 0; c < 3; ++c) {
+        uint32_t h = static_cast<uint32_t>(x * 0x9E3779B1u) ^
+                     static_cast<uint32_t>(y * 0x85EBCA77u) ^
+                     static_cast<uint32_t>(c * 0xC2B2AE3Du);
+        h ^= h >> 15;
+        h *= 0x2C1B3C6Du;
+        h ^= h >> 12;
+        float value;
+        if (h % 16 == 0) {
+          value = specials[(h >> 4) % 6];
+        } else {
+          value = std::ldexp(1.0f + ((h >> 8) & 255) / 256.0f,
+                             static_cast<int>((h >> 16) % 121) - 60);
+          if (h & 16) value = -value;
+        }
+        samples[(y * xsize + x) * 3 + c] = value;
+      }
+    }
+  }
+  for (jxl::SpeedTier speed :
+       {jxl::SpeedTier::kThunder, jxl::SpeedTier::kFalcon,
+        jxl::SpeedTier::kCheetah, jxl::SpeedTier::kSquirrel,
+        jxl::SpeedTier::kTortoise}) {
+    SCOPED_TRACE(static_cast<int>(speed));
+    auto io = jxl::make_unique<jxl::CodecInOut>(memory_manager);
+    io->metadata.m.SetFloat32Samples();
+    io->metadata.m.color_encoding = jxl::ColorEncoding::LinearSRGB();
+    JXL_TEST_ASSIGN_OR_DIE(jxl::Image3F color,
+                           jxl::Image3F::Create(memory_manager, xsize, ysize));
+    for (size_t y = 0; y < ysize; ++y) {
+      for (size_t x = 0; x < xsize; ++x) {
+        for (size_t c = 0; c < 3; ++c) {
+          color.PlaneRow(c, y)[x] = samples[(y * xsize + x) * 3 + c];
+        }
+      }
+    }
+    ASSERT_TRUE(
+        io->SetFromImage(std::move(color), jxl::ColorEncoding::LinearSRGB()));
+    jxl::CompressParams cparams;
+    cparams.SetLossless();
+    cparams.speed_tier = speed;
+    std::vector<uint8_t> compressed;
+    ASSERT_TRUE(jxl::test::EncodeFile(cparams, io.get(), &compressed));
+
+    jxl::extras::JXLDecompressParams dparams;
+    dparams.accepted_formats = {{3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0}};
+    jxl::extras::PackedPixelFile ppf;
+    ASSERT_TRUE(jxl::extras::DecodeImageJXL(compressed.data(),
+                                            compressed.size(), dparams,
+                                            /*decoded_bytes=*/nullptr, &ppf));
+    ASSERT_EQ(1u, ppf.frames.size());
+    const jxl::extras::PackedImage& image = ppf.frames[0].color;
+    ASSERT_EQ(samples.size() * sizeof(float), image.pixels_size);
+    EXPECT_EQ(0, memcmp(samples.data(), image.pixels(), image.pixels_size));
+  }
 }

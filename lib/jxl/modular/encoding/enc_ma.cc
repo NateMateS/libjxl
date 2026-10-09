@@ -888,7 +888,10 @@ void TreeSamples::PreQuantizeProperties(
   auto quantize_abs_pixel_property = [&]() {
     if (abs_pixel_thresholds.empty()) {
       quantize_pixel_property();  // Compute the non-abs thresholds.
-      for (auto &v : pixel_samples) v = std::abs(v);
+      // As the property is computed (PrecomputeReferences): INT32_MIN stays.
+      for (auto &v : pixel_samples) {
+        v = static_cast<pixel_type>(std::abs(static_cast<pixel_type_w>(v)));
+      }
       abs_pixel_thresholds =
           QuantizeSamples(pixel_samples, max_property_values);
     }
@@ -905,7 +908,9 @@ void TreeSamples::PreQuantizeProperties(
   auto quantize_abs_diff_property = [&]() {
     if (abs_diff_thresholds.empty()) {
       quantize_diff_property();  // Compute the non-abs thresholds.
-      for (auto &v : diff_samples) v = std::abs(v);
+      for (auto &v : diff_samples) {
+        v = static_cast<pixel_type>(std::abs(static_cast<pixel_type_w>(v)));
+      }
       abs_diff_thresholds = QuantizeSamples(diff_samples, max_property_values);
     }
     return abs_diff_thresholds;

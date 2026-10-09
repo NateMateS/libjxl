@@ -24,6 +24,15 @@
 
 namespace jxl {
 
+// The residual of `value` against the prediction `guess` as decoders invert
+// it: modulo 2^32 (see make_pixel in encoding.cc). Samples that are binary32
+// bit patterns can differ by more than an int32 holds.
+constexpr int32_t WrappingResidual(int32_t value, int32_t guess)
+    JXL_NO_SANITIZE("unsigned-integer-overflow") {
+  return static_cast<int32_t>(static_cast<uint32_t>(value) -
+                              static_cast<uint32_t>(guess));
+}
+
 namespace weighted {
 constexpr static size_t kNumPredictors = 4;
 constexpr static int64_t kPredExtraBits = 3;

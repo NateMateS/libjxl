@@ -250,7 +250,6 @@ float EstimateWPCost(const Image& img, size_t i) {
     const ptrdiff_t onerow = ch.plane.PixelsPerRow();
     weighted::State wp_state(wp_header, ch.w, ch.h);
     Properties properties(1);
-    bool unhealthy = false;
     for (size_t y = 0; y < ch.h; y++) {
       const pixel_type* JXL_RESTRICT r = ch.Row(y);
       for (size_t x = 0; x < ch.w; x++) {
@@ -268,8 +267,7 @@ float EstimateWPCost(const Image& img, size_t i) {
         for (int c : cutoffs) {
           ctx += (c >= properties[0]) ? 1 : 0;
         }
-        pixel_type res;
-        unhealthy |= SubOverflow(r[x], guess, res);
+        pixel_type res = WrappingResidual(r[x], guess);
         uint32_t token;
         uint32_t nbits;
         uint32_t bits;
@@ -278,10 +276,6 @@ float EstimateWPCost(const Image& img, size_t i) {
         extra_bits += nbits;
         wp_state.UpdateErrors(r[x], x, y, ch.w);
       }
-    }
-    if (unhealthy) {
-      // Force this predictor option to be rejected by the cost selector.
-      return std::numeric_limits<float>::max();
     }
     for (auto& h : histo) {
       histo_cost += h.ShannonEntropy();
@@ -330,6 +324,14 @@ StatusOr<bool> maybe_do_transform(Image& image, const Transform& tr,
   return did_it;
 }
 
+// A palette's maximum number of colours, from a heuristic that can exceed an
+// int: the sample range of binary32 images (coded as their bit patterns) is
+// up to 2^32.
+int PaletteColorLimit(double colors) {
+  return static_cast<int>(
+      std::min<double>(colors, std::numeric_limits<int>::max()));
+}
+
 Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
                     const CompressParams& cparams_,
                     float channel_colors_percent,
@@ -361,7 +363,7 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       // also if the entropy (estimated bpp) is low (e.g. mostly solid/gradient
       // areas), palette is less useful and may even be counterproductive.
       maybe_palette.nb_colors = std::min(
-          static_cast<int>(cost_before * 0.0005f + nb_pixels / 128 + 128),
+          PaletteColorLimit(cost_before * 0.0005f + nb_pixels / 128 + 128),
           std::abs(cparams_.palette_colors));
       maybe_palette.ordered_palette = cparams_.palette_colors >= 0;
       maybe_palette.lossy_palette =
@@ -383,7 +385,7 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       maybe_palette_3.begin_c = gi.nb_meta_channels;
       maybe_palette_3.num_c = nb_chans - 1;
       maybe_palette_3.nb_colors = std::min(
-          static_cast<int>(cost_before * 0.0005f + nb_pixels / 128 + 128),
+          PaletteColorLimit(cost_before * 0.0005f + nb_pixels / 128 + 128),
           std::abs(cparams_.palette_colors));
       maybe_palette_3.ordered_palette = cparams_.palette_colors >= 0;
       maybe_palette_3.lossy_palette = cparams_.lossy_palette;
@@ -423,8 +425,8 @@ Status try_palettes(Image& gi, int& max_bitdepth, int& maxval,
       // (but only if the channel palette is less than 6% the size of the
       // image itself)
       maybe_palette_1.nb_colors =
-          std::min(static_cast<int>(nb_pixels / 16),
-                   static_cast<int>(channel_colors_percent / 100. * colors));
+          std::min(PaletteColorLimit(nb_pixels / 16),
+                   PaletteColorLimit(channel_colors_percent / 100. * colors));
       JXL_ASSIGN_OR_RETURN(
           bool did_ch_palette,
           maybe_do_transform(gi, maybe_palette_1, cparams_, weighted::Header(),
