@@ -33,6 +33,7 @@ endif()
 list(APPEND JPEGXL_INTERNAL_TESTS
   # TODO(deymo): Move this to tools/
   ../tools/djxl_fuzzer_test.cc
+  ../tools/file_io_test.cc
   ../tools/gauss_blur_test.cc
 )
 

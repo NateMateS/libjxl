@@ -61,7 +61,7 @@ class FileWrapper {
       if (err) {
         fprintf(stderr,
                 "Could not close file\n"
-                "Error: %s",
+                "Error: %s\n",
                 strerror(errno));
       }
     }
@@ -138,14 +138,14 @@ static inline bool WriteFile(const std::string& filename,
   if (!file) {
     fprintf(stderr,
             "Could not open %s for writing\n"
-            "Error: %s",
+            "Error: %s\n",
             filename.c_str(), strerror(errno));
     return false;
   }
   if (fwrite(bytes.data(), 1, bytes.size(), file) != bytes.size()) {
     fprintf(stderr,
             "Could not write to file\n"
-            "Error: %s",
+            "Error: %s\n",
             strerror(errno));
     return false;
   }
