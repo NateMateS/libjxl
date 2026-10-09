@@ -833,9 +833,11 @@ JXL_EXPORT JxlDecoderStatus JxlDecoderSetPreferredColorProfile(
  * performed is not meant to be considered authoritative in any way. It may
  * change from version to version.
  * @param dec decoder object
- * @param desired_intensity_target the intended target peak luminance
+ * @param desired_intensity_target the intended target peak luminance, in nits:
+ *     from 2^-24 to 65504 (the range of the image's own intensity target), or
+ *     `0` (the default) for no tone mapping.
  * @return ::JXL_DEC_SUCCESS if the preference was set successfully, @ref
- * JXL_DEC_ERROR otherwise.
+ * JXL_DEC_ERROR for a value outside that range, NaN included.
  */
 JXL_EXPORT JxlDecoderStatus JxlDecoderSetDesiredIntensityTarget(
     JxlDecoder* dec, float desired_intensity_target);

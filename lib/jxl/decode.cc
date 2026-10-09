@@ -3139,8 +3139,16 @@ JxlDecoderStatus JxlDecoderSetOutputColorProfile(
 
 JxlDecoderStatus JxlDecoderSetDesiredIntensityTarget(
     JxlDecoder* dec, float desired_intensity_target) {
-  if (desired_intensity_target < 0) {
-    return JXL_API_ERROR("negative intensity target requested");
+  // 0 keeps the image's intensity target. Other targets have the range of
+  // the image's own (a positive binary16): smaller ones give NaN output (PQ),
+  // and NaN would silently act as 0.
+  constexpr float kMinIntensityTarget = 1.0f / (1 << 24);
+  constexpr float kMaxIntensityTarget = 65504.0f;
+  if (desired_intensity_target != 0 &&
+      !(desired_intensity_target >= kMinIntensityTarget &&
+        desired_intensity_target <= kMaxIntensityTarget)) {
+    return JXL_API_ERROR(
+        "intensity target must be 0, or from 2^-24 to 65504 nits");
   }
   dec->desired_intensity_target = desired_intensity_target;
   return JXL_DEC_SUCCESS;

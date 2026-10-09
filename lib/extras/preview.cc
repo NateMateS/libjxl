@@ -130,9 +130,10 @@ bool ValidColorEncoding(const JxlColorEncoding& c) {
 }
 
 bool ValidDisplayNits(float nits) {
-  // Subnormal or infinite targets make the tone mapping output NaN.
+  // The range of JxlDecoderSetDesiredIntensityTarget: smaller targets make
+  // the tone mapping output NaN.
   return nits == 0.0f || nits == JXL_PREVIEW_NO_TONE_MAPPING ||
-         (std::isnormal(nits) && nits > 0.0f);
+         (nits >= 1.0f / (1 << 24) && nits <= 65504.0f);
 }
 
 // The bytes per pixel of a supported output format, 0 for any other.

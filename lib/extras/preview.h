@@ -223,7 +223,7 @@ typedef struct {
   /** Display peak luminance for HDR-to-SDR tone mapping, in nits.
    *  - `0` (default): auto-pick a sensible SDR target (currently 250 nits).
    *  - @ref JXL_PREVIEW_NO_TONE_MAPPING - skip tone mapping entirely.
-   *  - Any positive, normal, finite value: tone-map to this peak luminance.
+   *  - From 2^-24 to 65504: tone-map to this peak luminance.
    *  - Anything else: @ref JXL_PREVIEW_INVALID_ARGUMENT.
    */
   float display_nits;

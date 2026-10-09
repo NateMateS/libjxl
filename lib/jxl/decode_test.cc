@@ -1930,6 +1930,72 @@ TEST(DecodeTest, SetPreferredColorProfileTestFromGray) {
   SetPreferredColorProfileTest(gray, false, false);
 }
 
+// The desired intensity target is 0 (no tone mapping) or in the range of an
+// image's own intensity target, 2^-24 to 65504 nits. Smaller targets used to
+// be accepted and made the output of PQ images NaN, and NaN acted as 0.
+TEST(DecodeTest, DesiredIntensityTargetRange) {
+  constexpr float kMinTarget = 1.0f / (1 << 24);
+  constexpr float kMaxTarget = 65504.0f;
+  constexpr float kInf = std::numeric_limits<float>::infinity();
+  JxlDecoderPtr dec = JxlDecoderMake(nullptr);
+  ASSERT_NE(dec, nullptr);
+  for (float target :
+       {std::numeric_limits<float>::denorm_min(),
+        std::numeric_limits<float>::min(), std::nextafter(kMinTarget, 0.0f),
+        std::nextafter(kMaxTarget, kInf), kInf, -kInf,
+        std::numeric_limits<float>::quiet_NaN(), -1.0f}) {
+    SCOPED_TRACE(target);
+    EXPECT_EQ(JXL_DEC_ERROR,
+              JxlDecoderSetDesiredIntensityTarget(dec.get(), target));
+  }
+  for (float target : {0.0f, kMinTarget, 1.0f, 255.0f, kMaxTarget}) {
+    SCOPED_TRACE(target);
+    EXPECT_EQ(JXL_DEC_SUCCESS,
+              JxlDecoderSetDesiredIntensityTarget(dec.get(), target));
+  }
+
+  // The output is finite at both bounds.
+  constexpr size_t xsize = 64;
+  constexpr size_t ysize = 48;
+  const std::vector<uint8_t> pixels =
+      jxl::test::GetSomeTestImage(xsize, ysize, 3, 0);
+  for (bool pq : {true, false}) {
+    for (bool lossless : {false, true}) {
+      jxl::TestCodestreamParams params;
+      params.color_space = pq ? "RGB_D65_202_Rel_PeQ" : "RGB_D65_202_Rel_HLG";
+      params.intensity_target = pq ? 10000.0f : 1000.0f;
+      if (lossless) params.cparams.SetLossless();
+      const std::vector<uint8_t> compressed = jxl::CreateTestJXLCodestream(
+          jxl::Bytes(pixels.data(), pixels.size()), xsize, ysize, 3, params);
+      for (float target : {kMinTarget, kMaxTarget}) {
+        SCOPED_TRACE(::testing::Message()
+                     << params.color_space << (lossless ? " lossless" : "")
+                     << ", target " << target);
+        JxlDecoderPtr decoder = JxlDecoderMake(nullptr);
+        ASSERT_EQ(JXL_DEC_SUCCESS,
+                  JxlDecoderSubscribeEvents(decoder.get(), JXL_DEC_FULL_IMAGE));
+        ASSERT_EQ(JXL_DEC_SUCCESS,
+                  JxlDecoderSetDesiredIntensityTarget(decoder.get(), target));
+        ASSERT_EQ(JXL_DEC_SUCCESS,
+                  JxlDecoderSetInput(decoder.get(), compressed.data(),
+                                     compressed.size()));
+        JxlDecoderCloseInput(decoder.get());
+        const JxlPixelFormat format = {3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
+        std::vector<float> out(xsize * ysize * 3);
+        ASSERT_EQ(JXL_DEC_NEED_IMAGE_OUT_BUFFER,
+                  JxlDecoderProcessInput(decoder.get()));
+        ASSERT_EQ(JXL_DEC_SUCCESS, JxlDecoderSetImageOutBuffer(
+                                       decoder.get(), &format, out.data(),
+                                       out.size() * sizeof(float)));
+        ASSERT_EQ(JXL_DEC_FULL_IMAGE, JxlDecoderProcessInput(decoder.get()));
+        size_t non_finite = 0;
+        for (float v : out) non_finite += std::isfinite(v) ? 0 : 1;
+        EXPECT_EQ(0u, non_finite);
+      }
+    }
+  }
+}
+
 static std::string DecodeAllEncodingsVariantsTestName(
     const ::testing::TestParamInfo<
         std::tuple<jxl::test::ColorEncodingDescriptor, bool, bool>>& info) {
@@ -9583,6 +9649,7 @@ TEST(DecodeTest, PreviewApiRejectsInvalidArguments) {
   EXPECT_EQ(JXL_PREVIEW_INVALID_ARGUMENT,
             JxlGetPreviewInfo(input.data(), input.size(), &query, &info));
   for (float nits : {std::numeric_limits<float>::denorm_min(),
+                     std::numeric_limits<float>::min(), 65505.0f,
                      std::numeric_limits<float>::infinity(),
                      std::numeric_limits<float>::quiet_NaN(), -2.0f}) {
     SCOPED_TRACE(nits);
