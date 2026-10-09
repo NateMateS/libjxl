@@ -12,7 +12,9 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
+#include <new>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -31,6 +33,7 @@
 #include "lib/jxl/dec_bit_reader.h"
 #include "lib/jxl/dec_cache.h"
 #include "lib/jxl/dec_frame.h"
+#include "lib/jxl/dec_xyb.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/fake_parallel_runner_testonly.h"
 #include "lib/jxl/fields.h"
@@ -630,6 +633,40 @@ TEST(RenderPipelineDecodingTest, Animation) {
           io_default->frames[i].extra_channels()[ec], kMaxError, kMaxError, _));
     }
   }
+}
+
+// Stages copy OutputEncodingInfo whole, also when the image leaves some of
+// its members unset (all_default_opsin is set only for XYB images): every
+// member has a default, whatever the memory held before.
+TEST(RenderPipelineTest, OutputEncodingInfoDefaults) {
+  alignas(OutputEncodingInfo) uint8_t storage[sizeof(OutputEncodingInfo)];
+  // Volatile stores, which are not dropped as dead before the construction.
+  volatile uint8_t* fill = storage;
+  for (size_t i = 0; i < sizeof(storage); ++i) fill[i] = 0x40;
+  OutputEncodingInfo* info = new (storage) OutputEncodingInfo;
+  // Read as bytes: without defaults, the members would be indeterminate.
+  const auto all_zero = [](const void* member, size_t size) {
+    std::vector<uint8_t> bytes(size);
+    memcpy(bytes.data(), member, size);
+    return std::all_of(bytes.begin(), bytes.end(),
+                       [](uint8_t b) { return b == 0; });
+  };
+#define JXL_EXPECT_ZERO_MEMBER(member) \
+  EXPECT_TRUE(all_zero(&info->member, sizeof(info->member))) << #member
+  JXL_EXPECT_ZERO_MEMBER(orig_intensity_target);
+  JXL_EXPECT_ZERO_MEMBER(orig_inverse_matrix);
+  JXL_EXPECT_ZERO_MEMBER(default_transform);
+  JXL_EXPECT_ZERO_MEMBER(xyb_encoded);
+  JXL_EXPECT_ZERO_MEMBER(color_encoding_is_original);
+  JXL_EXPECT_ZERO_MEMBER(opsin_params);
+  JXL_EXPECT_ZERO_MEMBER(all_default_opsin);
+  JXL_EXPECT_ZERO_MEMBER(inverse_gamma);
+  JXL_EXPECT_ZERO_MEMBER(luminances);
+  JXL_EXPECT_ZERO_MEMBER(desired_intensity_target);
+  JXL_EXPECT_ZERO_MEMBER(cms_set);
+  JXL_EXPECT_ZERO_MEMBER(color_management_system);
+#undef JXL_EXPECT_ZERO_MEMBER
+  info->~OutputEncodingInfo();
 }
 
 }  // namespace
