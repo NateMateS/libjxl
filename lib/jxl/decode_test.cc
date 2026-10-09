@@ -9839,3 +9839,58 @@ TEST(DecodeTest, Non444AdaptiveDCSmoothingProhibited) {
   EXPECT_EQ(JXL_DEC_BASIC_INFO, JxlDecoderProcessInput(dec.get()));
   EXPECT_EQ(JXL_DEC_ERROR, JxlDecoderProcessInput(dec.get()));
 }
+
+// The last passes of a 1x1 frame are sections of size 0, so a progression step
+// before them can leave no input. Decoding must resume from there without
+// asking for more.
+TEST(DecodeTest, ProgressionResumesWithOnlyEmptySectionsLeft) {
+  jxl::TestCodestreamParams params;
+  params.cparams.progressive_mode = jxl::Override::kOn;
+  const std::vector<uint8_t> compressed =
+      CreateDCOnlyTestCodestream(/*xsize=*/1, /*ysize=*/1, 3, params);
+  const JxlPixelFormat format = {3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
+  const std::vector<uint8_t> expected = jxl::DecodeWithAPI(
+      jxl::Bytes(compressed.data(), compressed.size()), format,
+      /*use_callback=*/false, /*set_buffer_early=*/false,
+      /*use_resizable_runner=*/false, /*require_boxes=*/false,
+      /*expect_success=*/true);
+  for (JxlProgressiveDetail detail : {kLastPasses, kPasses}) {
+    SCOPED_TRACE(detail);
+    JxlDecoderPtr dec = JxlDecoderMake(nullptr);
+    ASSERT_EQ(JXL_DEC_SUCCESS,
+              JxlDecoderSubscribeEvents(
+                  dec.get(), JXL_DEC_FRAME_PROGRESSION | JXL_DEC_FULL_IMAGE));
+    ASSERT_EQ(JXL_DEC_SUCCESS,
+              JxlDecoderSetProgressiveDetail(dec.get(), detail));
+    // The input is released at each step to see whether any is left, so it is
+    // not closed (a closed input cannot be set again).
+    ASSERT_EQ(JXL_DEC_SUCCESS, JxlDecoderSetInput(dec.get(), compressed.data(),
+                                                  compressed.size()));
+    bool paused_without_input = false;
+    std::vector<uint8_t> pixels;
+    for (;;) {
+      const JxlDecoderStatus status = JxlDecoderProcessInput(dec.get());
+      if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+        size_t buffer_size;
+        ASSERT_EQ(JXL_DEC_SUCCESS, JxlDecoderImageOutBufferSize(
+                                       dec.get(), &format, &buffer_size));
+        pixels.resize(buffer_size);
+        ASSERT_EQ(JXL_DEC_SUCCESS,
+                  JxlDecoderSetImageOutBuffer(dec.get(), &format, pixels.data(),
+                                              pixels.size()));
+      } else if (status == JXL_DEC_FRAME_PROGRESSION) {
+        const size_t remaining = JxlDecoderReleaseInput(dec.get());
+        if (remaining == 0) paused_without_input = true;
+        const uint8_t* rest = compressed.data() + compressed.size() - remaining;
+        ASSERT_EQ(JXL_DEC_SUCCESS,
+                  JxlDecoderSetInput(dec.get(), rest, remaining));
+      } else {
+        ASSERT_EQ(JXL_DEC_FULL_IMAGE, status);
+        break;
+      }
+    }
+    // Otherwise the encoder no longer makes the case this test is about.
+    EXPECT_TRUE(paused_without_input);
+    EXPECT_EQ(expected, pixels);
+  }
+}

@@ -692,7 +692,11 @@ struct JxlDecoder {
     return JXL_DEC_NEED_MORE_INPUT;
   }
 
-  JxlDecoderStatus GetCodestreamInput(jxl::Span<const uint8_t>* span) {
+  // Sets `span` to the codestream input available now. Without any, more input
+  // is requested, unless `allow_empty`: `span` is then empty, for callers that
+  // can use zero bytes (sections of size 0).
+  JxlDecoderStatus GetCodestreamInput(jxl::Span<const uint8_t>* span,
+                                      bool allow_empty = false) {
     if (codestream_copy.empty() && codestream_pos > 0) {
       size_t avail_codestream = AvailableCodestream();
       size_t skip = std::min<size_t>(codestream_pos, avail_codestream);
@@ -712,7 +716,11 @@ struct JxlDecoder {
     size_t avail_codestream = AvailableCodestream();
     if (codestream_copy.empty()) {
       if (avail_codestream == 0) {
-        return RequestMoreInput();
+        if (!allow_empty) return RequestMoreInput();
+        // next_in is null once the input is released.
+        static constexpr uint8_t kNoInput = 0;
+        *span = jxl::Bytes(&kNoInput, 0);
+        return JXL_DEC_SUCCESS;
       }
       *span = jxl::Bytes(next_in, avail_codestream);
       return JXL_DEC_SUCCESS;
@@ -1235,7 +1243,10 @@ JxlDecoderStatus JxlDecoderReadAllHeaders(JxlDecoder* dec) {
 
 JxlDecoderStatus JxlDecoderProcessSections(JxlDecoder* dec) {
   Span<const uint8_t> span;
-  JXL_API_RETURN_IF_ERROR(dec->GetCodestreamInput(&span));
+  // A frame's last sections can all be empty, and a progression step can
+  // pause before them: they are processed although no input is left. With
+  // nothing processable, more input is requested after processing.
+  JXL_API_RETURN_IF_ERROR(dec->GetCodestreamInput(&span, /*allow_empty=*/true));
   const auto& toc = dec->frame_dec->Toc();
   size_t pos = 0;
   std::vector<jxl::FrameDecoder::SectionInfo> section_info;
