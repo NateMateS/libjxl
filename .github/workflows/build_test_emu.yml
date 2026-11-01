@@ -8,8 +8,6 @@
 name: Build/Test in emulator
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '14 3 * * *' # Daily on 03:14 UTC
 
 permissions:
   contents: read
